@@ -1,4 +1,4 @@
-"""Forex Edge Finder — Professional Trading Hub Dashboard."""
+"""Forex Edge Finder — Professional Strategy Backtester & Trading Hub."""
 
 import streamlit as st
 import pandas as pd
@@ -151,7 +151,7 @@ st.markdown("""
 <div class="hub-header">
     <div>
         <div class="hub-title">FOREX EDGE FINDER</div>
-        <div class="hub-subtitle">Liquidity Inducement Strategy Backtester &amp; Analytics Hub</div>
+        <div class="hub-subtitle">Professional Strategy Backtester &amp; Analytics Hub</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -598,7 +598,7 @@ if run_btn or optimize_btn:
                                         use_container_width=True)
                 with exp2:
                     report = (
-                        f"FOREX EDGE FINDER - BACKTEST REPORT\n"
+                        f"FOREX EDGE FINDER - STRATEGY BACKTEST REPORT\n"
                         f"{'='*50}\n"
                         f"Pair: {pair} | TF: {interval} | Period: {period}\n"
                         f"Strategy: {strategy}\n\n"
@@ -1214,35 +1214,38 @@ elif not run_btn and not optimize_btn and not scan_btn:
         col_l, col_r = st.columns(2)
         with col_l:
             st.markdown("""
-            #### Signal Types
-            - **Sweep Reversal** — Wick beyond liquidity level, close inside
-            - **Inducement Trap** — Minor swing broken to trap traders
-            - **Stop Hunt** — Spike with 2x wick:body ratio + rejection
+            #### Strategy Engine
+            - **Smart Money Concepts** — Liquidity sweeps, inducement traps, stop hunts
+            - **Market Structure** — BOS/CHoCH detection with directional bias filtering
+            - **Multi-Timeframe** — Combined swing analysis across multiple lookback periods
+            - **Session-Aware** — London, New York, Asia, overlap & killzone filters
 
             #### Confluence Scoring (8 factors)
             - Killzone timing (London/NY open/close)
-            - Displacement (momentum > 1.5x ATR)
+            - Displacement (strong momentum > 1.5x ATR)
             - Engulfing candle patterns
             - Fair Value Gap alignment
             - Order block proximity
             - EMA trend alignment (21/50)
-            - RSI extremes
+            - RSI extremes (oversold/overbought)
             - Level strength (multi-touch)
             """)
 
         with col_r:
             st.markdown("""
             #### Risk Management
-            - Trailing stop loss with activation threshold
-            - Break-even protection
-            - Partial take profit
-            - Spread simulation
+            - Trailing stop loss with R-multiple activation
+            - Break-even protection at configurable threshold
+            - Partial take profit with custom close %
+            - Realistic spread simulation
             - Max trades/day limit
             - Consecutive loss circuit breaker
 
-            #### Tools
-            - **Optimizer** — Grid search 768+ param combos
-            - **Scanner** — Rank all 10 major pairs by edge
-            - **Account Sim** — Realistic growth simulation
-            - **Export** — CSV trade log + text reports
+            #### Analytics & Tools
+            - **Backtester** — Full trade simulation with MFE/MAE tracking
+            - **Optimizer** — Grid search 768+ parameter combinations
+            - **Scanner** — Rank all 10 major pairs by edge score
+            - **Account Sim** — Growth simulation with multiple sizing modes
+            - **Deep Analytics** — Monthly/daily/hourly P&L, session & signal breakdowns
+            - **Export** — CSV trade logs + text reports
             """)
