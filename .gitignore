@@ -14,3 +14,4 @@ ENV/
 data/*.csv
 *.pkl
 .DS_Store
+discovery_results/
