@@ -2,7 +2,7 @@
 
 import pandas as pd
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List
 from data.loader import FOREX_PAIRS, fetch_pair
 from engine.backtester import run_backtest, BacktestResult
 

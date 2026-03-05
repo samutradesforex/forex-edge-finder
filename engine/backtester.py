@@ -12,7 +12,7 @@ Features:
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from itertools import product
 from engine.liquidity import (
     InducementSignal,
@@ -577,7 +577,10 @@ def run_backtest(
 
         if trade:
             trades.append(trade)
-            exit_idx = df.index.get_loc(trade.exit_datetime)
+            try:
+                exit_idx = df.index.get_loc(trade.exit_datetime)
+            except KeyError:
+                exit_idx = df.index.searchsorted(trade.exit_datetime)
             last_exit_idx = exit_idx
 
             day_key = sig.entry_datetime.strftime("%Y-%m-%d")

@@ -6,9 +6,8 @@ as a directional filter for the liquidity signals.
 """
 
 import pandas as pd
-import numpy as np
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 from engine.liquidity import SwingPoint, find_swing_points
 
 
