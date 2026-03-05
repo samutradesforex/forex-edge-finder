@@ -44,6 +44,7 @@ def fetch_pair(pair_name: str, period: str = "6mo", interval: str = "1h") -> pd.
     cols = ["Open", "High", "Low", "Close", "Volume"]
     df = df[[c for c in cols if c in df.columns]].copy()
     df.index.name = "Datetime"
+    _validate_ohlc(df)
     return df
 
 
@@ -54,4 +55,18 @@ def load_csv(path_or_buffer) -> pd.DataFrame:
     """
     df = pd.read_csv(path_or_buffer, parse_dates=True, index_col=0)
     df.index.name = "Datetime"
+    _validate_ohlc(df)
     return df
+
+
+def _validate_ohlc(df: pd.DataFrame) -> None:
+    """Validate that the DataFrame has required OHLC columns and sane data."""
+    required = {"Open", "High", "Low", "Close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}. "
+                         f"Found: {', '.join(df.columns.tolist())}")
+    if len(df) < 30:
+        raise ValueError(f"Insufficient data: got {len(df)} rows, need at least 30")
+    if df[list(required)].isna().all(axis=None):
+        raise ValueError("All OHLC values are NaN — check your data source")

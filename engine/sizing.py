@@ -41,13 +41,21 @@ class AccountSimulation:
     states: List[AccountState] = field(default_factory=list)
 
 
-def pip_value(pair_name: str, lot_size: float = 1.0) -> float:
-    """Calculate pip value in USD for a standard lot.
+def _get_pip_size(pair_name: str) -> float:
+    """Return pip size for a currency pair."""
+    jpy_pairs = ("USD/JPY", "EUR/JPY", "GBP/JPY", "AUD/JPY", "CAD/JPY", "NZD/JPY",
+                 "CHF/JPY")
+    return 0.01 if pair_name in jpy_pairs else 0.0001
 
-    Simplified: assumes USD account. For XXX/USD pairs, 1 standard lot = $10/pip.
-    For USD/XXX pairs, varies but we approximate at $10.
+
+def pip_value(pair_name: str, lot_size: float = 1.0) -> float:
+    """Calculate pip value in USD for a given lot size.
+
+    For XXX/USD pairs, 1 standard lot = $10/pip exactly.
+    For USD/XXX pairs the value varies with the exchange rate, but we
+    approximate at $10 since we don't have live quotes here.
+    For JPY pairs, pip size differs but value per pip is still ~$10/lot.
     """
-    # Standard lot pip value is approximately $10 for most pairs
     return 10.0 * lot_size
 
 
@@ -108,9 +116,9 @@ def simulate_account(
         elif sizing_mode == "risk_pct":
             base_balance = balance if compounding else starting_balance
             risk_amount = base_balance * (risk_pct / 100)
-            # Calculate lot size from risk amount and SL distance
-            sl_pips = abs(trade.pnl_pips) if trade.result == "loss" else abs(
-                (trade.entry_price - trade.stop_loss) / (0.01 if "JPY" in pair_name else 0.0001))
+            # Always calculate SL distance from entry price and stop loss
+            pip_sz = _get_pip_size(pair_name)
+            sl_pips = abs(trade.entry_price - trade.stop_loss) / pip_sz
             if sl_pips > 0:
                 pv_per_lot = pip_value(pair_name, 1.0)
                 lot_size = risk_amount / (sl_pips * pv_per_lot)
@@ -122,8 +130,8 @@ def simulate_account(
             base_balance = balance if compounding else starting_balance
             effective_risk = min(kelly_fraction, max_risk_pct / 100)
             risk_amount = base_balance * effective_risk
-            sl_pips = abs(
-                (trade.entry_price - trade.stop_loss) / (0.01 if "JPY" in pair_name else 0.0001))
+            pip_sz = _get_pip_size(pair_name)
+            sl_pips = abs(trade.entry_price - trade.stop_loss) / pip_sz
             if sl_pips > 0:
                 pv_per_lot = pip_value(pair_name, 1.0)
                 lot_size = risk_amount / (sl_pips * pv_per_lot)

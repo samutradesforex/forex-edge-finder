@@ -303,25 +303,32 @@ def calc_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def has_displacement(df: pd.DataFrame, index: int, direction: str,
-                     atr: pd.Series, multiplier: float = 1.5) -> bool:
+                     atr: pd.Series, multiplier: float = 1.5,
+                     _close_arr=None, _open_arr=None, _atr_arr=None) -> bool:
     """Check if there is strong displacement (momentum) at the given candle."""
     if index < 1 or index >= len(df):
         return False
-    body = abs(df["Close"].iloc[index] - df["Open"].iloc[index])
-    atr_val = atr.iloc[index]
-    if pd.isna(atr_val) or atr_val == 0:
+    close_arr = _close_arr if _close_arr is not None else df["Close"].values
+    open_arr = _open_arr if _open_arr is not None else df["Open"].values
+    atr_arr = _atr_arr if _atr_arr is not None else atr.values
+    body = abs(close_arr[index] - open_arr[index])
+    atr_val = atr_arr[index]
+    if np.isnan(atr_val) or atr_val == 0:
         return False
     return body > (atr_val * multiplier)
 
 
-def is_engulfing(df: pd.DataFrame, index: int, direction: str) -> bool:
+def is_engulfing(df: pd.DataFrame, index: int, direction: str,
+                 _open_arr=None, _close_arr=None) -> bool:
     """Check if candle at index is an engulfing pattern."""
     if index < 1:
         return False
-    curr_open = df["Open"].iloc[index]
-    curr_close = df["Close"].iloc[index]
-    prev_open = df["Open"].iloc[index - 1]
-    prev_close = df["Close"].iloc[index - 1]
+    open_arr = _open_arr if _open_arr is not None else df["Open"].values
+    close_arr = _close_arr if _close_arr is not None else df["Close"].values
+    curr_open = open_arr[index]
+    curr_close = close_arr[index]
+    prev_open = open_arr[index - 1]
+    prev_close = close_arr[index - 1]
 
     if direction == "long":
         return (curr_close > curr_open and prev_close < prev_open and
@@ -380,7 +387,7 @@ def score_confluence(df: pd.DataFrame, index: int, direction: str,
             factors.append("displacement")
 
     # 3. Engulfing candle
-    if is_engulfing(df, index, direction):
+    if is_engulfing(df, index, direction, _open_arr=open_arr, _close_arr=close_arr):
         score += 1
         factors.append("engulfing")
 

@@ -479,6 +479,9 @@ def run_backtest(
     _precomputed: dict = None,
 ) -> BacktestResult:
     """Run a full backtest with all advanced features."""
+    if len(df) < 30:
+        raise ValueError(f"Insufficient data: {len(df)} candles (need at least 30)")
+
     pip_size = get_pip_size(pair_name)
 
     # Use pre-computed indicators when available (optimizer passes these)

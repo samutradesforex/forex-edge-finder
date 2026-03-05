@@ -33,6 +33,7 @@ def scan_all_pairs(
         pairs = list(FOREX_PAIRS.keys())
 
     results = []
+    failed_pairs = []
 
     for pair_name in pairs:
         try:
@@ -58,11 +59,12 @@ def scan_all_pairs(
             results.append(PairScanResult(
                 pair=pair_name, backtest=bt, edge_score=round(edge, 1),
             ))
-        except (ValueError, KeyError, IndexError):
+        except Exception:
+            failed_pairs.append(pair_name)
             continue
 
     results.sort(key=lambda r: r.edge_score, reverse=True)
-    return results
+    return results, failed_pairs
 
 
 def scan_summary_df(results: List[PairScanResult]) -> pd.DataFrame:

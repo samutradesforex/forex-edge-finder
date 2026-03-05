@@ -501,13 +501,15 @@ if scan_btn:
         section("Multi-Pair Scanner")
         with st.spinner("Scanning all pairs..."):
             try:
-                scan_results = scan_all_pairs(
+                scan_results, failed_pairs = scan_all_pairs(
                     period=period, interval=yf_interval,
                     swing_lookback=swing_lookback, cluster_pips=cluster_pips,
                     min_wick_pips=min_wick_pips, strategy=strategy,
                     rr_ratio=rr_ratio, spread_pips=spread_pips,
                     min_confluence=min_confluence,
                 )
+                if failed_pairs:
+                    st.warning(f"Failed to scan: {', '.join(failed_pairs)}")
                 if scan_results:
                     summary = scan_summary_df(scan_results)
                     st.dataframe(summary, use_container_width=True, hide_index=True)
@@ -552,8 +554,16 @@ if run_btn or optimize_btn:
         with st.spinner("Running backtest..."):
             bt_kwargs = get_backtest_kwargs()
             result = run_backtest(df, pair, **bt_kwargs)
-            st.session_state["last_result"] = result
-            st.session_state["last_bt_kwargs"] = bt_kwargs
+
+            # Cache computed data for Chart tab reuse (avoid re-computing)
+            pip_size_cached = get_pip_size(pair)
+            swings_cached = find_swing_points(df, lookback=swing_lookback)
+            levels_cached = find_liquidity_levels(swings_cached, cluster_pips=cluster_pips,
+                                                   pip_size=pip_size_cached)
+            fvgs_cached = find_fvgs(df, pip_size=pip_size_cached)
+            st.session_state["chart_swings"] = swings_cached
+            st.session_state["chart_levels"] = levels_cached
+            st.session_state["chart_fvgs"] = fvgs_cached
 
         # Apply structure bias filter
         if use_structure_filter and structure_breaks:
@@ -1378,10 +1388,10 @@ if run_btn or optimize_btn:
                     str_breaks = structure_breaks
                 else:
                     _, str_breaks, _ = compute_structure(df, swing_lookback=swing_lookback)
-                swings = find_swing_points(df, lookback=swing_lookback)
-                levels = find_liquidity_levels(swings, cluster_pips=cluster_pips,
-                                               pip_size=pip_size)
-                fvg_list = find_fvgs(df, pip_size=pip_size)
+                # Reuse cached data from backtest run instead of re-computing
+                swings = st.session_state.get("chart_swings") or find_swing_points(df, lookback=swing_lookback)
+                levels = st.session_state.get("chart_levels") or find_liquidity_levels(swings, cluster_pips=cluster_pips, pip_size=pip_size)
+                fvg_list = st.session_state.get("chart_fvgs") or find_fvgs(df, pip_size=pip_size)
 
                 # Chart options
                 opt1, opt2, opt3, opt4 = st.columns(4)
