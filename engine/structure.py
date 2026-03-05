@@ -47,45 +47,48 @@ def detect_structure_breaks(df: pd.DataFrame, swings: List[SwingPoint]
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return breaks
 
-    # Determine initial bias from first few swings
-    bias = "neutral"
+    # Collect all potential break candidates with their break index,
+    # then process them chronologically so BOS/CHoCH classification
+    # uses the correct bias state at each point in time.
+    candidates = []
+
+    high_arr = df["High"].values
+    low_arr = df["Low"].values
 
     for i in range(1, len(swing_highs)):
         prev_sh = swing_highs[i - 1]
         curr_sh = swing_highs[i]
-
-        # Find candles between these swing highs that break above
         for j in range(prev_sh.index + 1, min(curr_sh.index + 1, len(df))):
-            if df["High"].iloc[j] > prev_sh.price:
-                if bias == "bearish":
-                    kind = "choch"
-                else:
-                    kind = "bos"
-                bias = "bullish"
-                breaks.append(StructureBreak(
-                    index=j, datetime=df.index[j], price=prev_sh.price,
-                    kind=kind, direction="bullish", broken_swing=prev_sh,
-                ))
+            if high_arr[j] > prev_sh.price:
+                candidates.append((j, "bullish", prev_sh))
                 break
 
     for i in range(1, len(swing_lows)):
         prev_sl = swing_lows[i - 1]
         curr_sl = swing_lows[i]
-
         for j in range(prev_sl.index + 1, min(curr_sl.index + 1, len(df))):
-            if df["Low"].iloc[j] < prev_sl.price:
-                if bias == "bullish":
-                    kind = "choch"
-                else:
-                    kind = "bos"
-                bias = "bearish"
-                breaks.append(StructureBreak(
-                    index=j, datetime=df.index[j], price=prev_sl.price,
-                    kind=kind, direction="bearish", broken_swing=prev_sl,
-                ))
+            if low_arr[j] < prev_sl.price:
+                candidates.append((j, "bearish", prev_sl))
                 break
 
-    breaks.sort(key=lambda b: b.index)
+    # Sort candidates chronologically, then classify BOS/CHoCH with correct bias
+    candidates.sort(key=lambda c: c[0])
+    bias = "neutral"
+
+    for break_idx, direction, broken_swing in candidates:
+        if direction == "bullish":
+            kind = "choch" if bias == "bearish" else "bos"
+            bias = "bullish"
+        else:
+            kind = "choch" if bias == "bullish" else "bos"
+            bias = "bearish"
+
+        breaks.append(StructureBreak(
+            index=break_idx, datetime=df.index[break_idx],
+            price=broken_swing.price,
+            kind=kind, direction=direction, broken_swing=broken_swing,
+        ))
+
     return breaks
 
 

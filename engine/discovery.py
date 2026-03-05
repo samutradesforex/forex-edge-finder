@@ -272,19 +272,29 @@ def walk_forward_validate(
     if split_idx < 50 or (n - split_idx) < 30:
         return None
 
-    # Out-of-sample data
+    # Out-of-sample data — include a lookback window before the split point
+    # so that EMA/RSI/ATR have proper warm-up data
+    indicator_warmup = 60  # candles of lookback for indicator calculation
+    warmup_start = max(0, split_idx - indicator_warmup)
+    df_oos_with_warmup = df.iloc[warmup_start:].copy()
     df_oos = df.iloc[split_idx:].copy()
     if len(df_oos) < 30:
         return None
 
     try:
-        # Compute indicators for OOS portion
+        # Compute indicators on data WITH warm-up, then slice to OOS portion
         pip_size = get_pip_size(pair)
+        atr_full = calc_atr(df_oos_with_warmup)
+        rsi_full = calc_rsi(df_oos_with_warmup)
+        ema_fast_full = calc_ema(df_oos_with_warmup["Close"], 21)
+        ema_slow_full = calc_ema(df_oos_with_warmup["Close"], 50)
+
+        # Slice indicators to match the OOS DataFrame index
         oos_precomputed = {
-            "atr": calc_atr(df_oos),
-            "rsi": calc_rsi(df_oos),
-            "ema_fast": calc_ema(df_oos["Close"], 21),
-            "ema_slow": calc_ema(df_oos["Close"], 50),
+            "atr": atr_full.loc[df_oos.index],
+            "rsi": rsi_full.loc[df_oos.index],
+            "ema_fast": ema_fast_full.loc[df_oos.index],
+            "ema_slow": ema_slow_full.loc[df_oos.index],
             "fvgs": find_fvgs(df_oos, pip_size=pip_size),
             "obs": find_order_blocks(df_oos, pip_size=pip_size),
         }
@@ -459,11 +469,15 @@ def run_discovery(
         for e in state.edges
     }
 
-    # Determine resume position
+    # Determine resume position using (pair, interval, strategy) tuple indices
+    # to avoid lexicographic comparison bugs across iteration order
     should_skip = resume and state.last_completed_pair
-    skip_pair = state.last_completed_pair if should_skip else ""
-    skip_interval = state.last_completed_interval if should_skip else ""
-    skip_strategy = state.last_completed_strategy if should_skip else ""
+    resume_key = None
+    if should_skip:
+        resume_key = (state.last_completed_pair, state.last_completed_interval,
+                      state.last_completed_strategy)
+
+    found_resume_point = not should_skip  # True if not resuming
 
     for pair in pairs:
         for intv in intervals:
@@ -475,9 +489,9 @@ def run_discovery(
             state.current_pair = pair
             state.current_interval = intv
 
-            # Resume: skip already-completed pair/interval/strategy combos
-            if should_skip:
-                if pair < skip_pair or (pair == skip_pair and intv < skip_interval):
+            # Resume: skip already-completed pair/interval combos
+            if not found_resume_point:
+                if pair != resume_key[0] or intv != resume_key[1]:
                     for strat in strategies:
                         combos = _get_strategy_combos(strat, param_grid)
                         state.combos_tested += len(combos)
@@ -488,6 +502,8 @@ def run_discovery(
                 for strat in strategies:
                     combos = _get_strategy_combos(strat, param_grid)
                     state.combos_tested += len(combos)
+                if not found_resume_point:
+                    found_resume_point = True  # resume point pair/intv matched but no data
                 continue
 
             # For walk-forward: split data
@@ -503,14 +519,13 @@ def run_discovery(
                     save_state(state)
                     return state
 
-                # Resume: skip completed strategies
-                if should_skip and pair == skip_pair and intv == skip_interval:
-                    if strat <= skip_strategy:
-                        combos = _get_strategy_combos(strat, param_grid)
-                        state.combos_tested += len(combos)
-                        if strat == skip_strategy:
-                            should_skip = False  # Done skipping
-                        continue
+                # Resume: skip completed strategies within the resume pair/interval
+                if not found_resume_point:
+                    combos = _get_strategy_combos(strat, param_grid)
+                    state.combos_tested += len(combos)
+                    if strat == resume_key[2]:
+                        found_resume_point = True  # Done skipping
+                    continue
 
                 state.current_strategy = strat
 

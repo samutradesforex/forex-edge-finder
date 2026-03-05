@@ -914,7 +914,11 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
             conf_score, conf_factors = score_confluence(
                 df, i, "long", level, atr, fvgs, obs, rsi,
                 ema_fast, ema_slow, pip_size, **conf_kw)
-            conf_factors = [f for f in conf_factors if f != "trend_aligned"]
+            # trend_aligned always fires at crossover (ema_f just crossed above ema_s)
+            # — remove the redundant factor AND adjust the score
+            if "trend_aligned" in conf_factors:
+                conf_factors.remove("trend_aligned")
+                conf_score -= 1
             conf_factors.insert(0, "ema_crossover")
 
             if conf_score < min_confluence:
@@ -941,7 +945,9 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
             conf_score, conf_factors = score_confluence(
                 df, i, "short", level, atr, fvgs, obs, rsi,
                 ema_fast, ema_slow, pip_size, **conf_kw)
-            conf_factors = [f for f in conf_factors if f != "trend_aligned"]
+            if "trend_aligned" in conf_factors:
+                conf_factors.remove("trend_aligned")
+                conf_score -= 1
             conf_factors.insert(0, "ema_crossover")
 
             if conf_score < min_confluence:
@@ -1036,6 +1042,11 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
             conf_score, conf_factors = score_confluence(
                 df, i, "long", level, atr, fvgs, obs, rsi,
                 ema_fast, ema_slow, pip_size, **conf_kw)
+            # Remove redundant RSI factor (rsi_reversal already implies oversold)
+            rsi_factors = [f for f in conf_factors if f.startswith("rsi_oversold")]
+            for rf in rsi_factors:
+                conf_factors.remove(rf)
+                conf_score -= 1
             conf_factors.insert(0, "rsi_reversal")
 
             if conf_score < min_confluence:
@@ -1066,6 +1077,10 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
             conf_score, conf_factors = score_confluence(
                 df, i, "short", level, atr, fvgs, obs, rsi,
                 ema_fast, ema_slow, pip_size, **conf_kw)
+            rsi_factors = [f for f in conf_factors if f.startswith("rsi_overbought")]
+            for rf in rsi_factors:
+                conf_factors.remove(rf)
+                conf_score -= 1
             conf_factors.insert(0, "rsi_reversal")
 
             if conf_score < min_confluence:

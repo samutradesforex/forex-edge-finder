@@ -48,13 +48,18 @@ def scan_all_pairs(
 
             # Calculate edge score (higher = better)
             edge = 0.0
-            if bt.profit_factor != float("inf"):
-                edge += min(bt.profit_factor, 5) * 10  # cap at 5
+            pf = bt.profit_factor
+            if pf != float("inf") and pf == pf:  # not inf and not NaN
+                edge += min(pf, 5) * 10  # cap at 5
             edge += bt.win_rate * 0.5
-            edge += bt.expectancy_pips * 2
+            exp = bt.expectancy_pips
+            if exp == exp:  # not NaN
+                edge += exp * 2
             if bt.max_drawdown_pips > 0:
                 edge += (bt.total_pips / bt.max_drawdown_pips) * 10
-            edge += bt.sharpe_ratio * 5
+            sr = bt.sharpe_ratio
+            if sr == sr and sr != float("inf") and sr != float("-inf"):
+                edge += sr * 5
 
             results.append(PairScanResult(
                 pair=pair_name, backtest=bt, edge_score=round(edge, 1),

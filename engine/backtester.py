@@ -209,10 +209,13 @@ class BacktestResult:
             if std_pnl > 0:
                 self.sharpe_ratio = (mean_pnl / std_pnl) * np.sqrt(trades_per_year)
             downside = pnl_arr[pnl_arr < 0]
-            if len(downside) > 0:
+            if len(downside) > 1:
                 downside_std = np.std(downside, ddof=1)
                 if downside_std > 0:
                     self.sortino_ratio = (mean_pnl / downside_std) * np.sqrt(trades_per_year)
+            elif len(downside) == 0 and mean_pnl > 0:
+                # No losing trades with positive mean → infinite risk-adjusted return
+                self.sortino_ratio = float("inf")
         if max_dd > 0:
             self.calmar_ratio = self.total_pips / max_dd
 
