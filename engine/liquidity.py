@@ -722,6 +722,557 @@ def detect_stop_hunts(df: pd.DataFrame, levels: List[LiquidityLevel],
     return signals
 
 
+# ── Common strategy signal generators ──────────────────────────────────────
+
+def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
+                         atr: pd.Series = None, fvgs: List[FairValueGap] = None,
+                         obs: List[OrderBlock] = None, rsi: pd.Series = None,
+                         ema_fast: pd.Series = None, ema_slow: pd.Series = None,
+                         min_confluence: int = 0, session_filter: str = "all",
+                         rr_ratio: float = 2.0,
+                         require_displacement: bool = False,
+                         ) -> List[InducementSignal]:
+    """Detect EMA crossover signals. Fast EMA crosses above/below slow EMA."""
+    signals = []
+    if atr is None:
+        atr = calc_atr(df)
+    if ema_fast is None:
+        ema_fast = calc_ema(df["Close"], 21)
+    if ema_slow is None:
+        ema_slow = calc_ema(df["Close"], 50)
+    if rsi is None:
+        rsi = calc_rsi(df)
+    if fvgs is None:
+        fvgs = []
+    if obs is None:
+        obs = []
+
+    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
+                                  formed_at=pd.Timestamp.now())
+
+    for i in range(2, len(df)):
+        if pd.isna(ema_fast.iloc[i]) or pd.isna(ema_slow.iloc[i]):
+            continue
+        if pd.isna(ema_fast.iloc[i - 1]) or pd.isna(ema_slow.iloc[i - 1]):
+            continue
+
+        dt = df.index[i]
+        if session_filter != "all":
+            session = get_session(dt)
+            if session != session_filter and session_filter != "killzones":
+                continue
+            if session_filter == "killzones" and not is_in_killzone(dt):
+                continue
+
+        close = df["Close"].iloc[i]
+        atr_val = atr.iloc[i]
+        if pd.isna(atr_val) or atr_val == 0:
+            continue
+
+        # Bullish crossover: fast crosses above slow
+        if ema_fast.iloc[i - 1] <= ema_slow.iloc[i - 1] and ema_fast.iloc[i] > ema_slow.iloc[i]:
+            sl = close - (atr_val * 1.5)
+            risk = close - sl
+            tp = close + (risk * rr_ratio)
+
+            dummy_level.price = close
+            dummy_level.kind = "sell_side"
+            conf_score, conf_factors = score_confluence(
+                df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                ema_fast, ema_slow, pip_size)
+            # EMA crossover always gets trend_aligned, remove duplicate
+            conf_factors = [f for f in conf_factors if f != "trend_aligned"]
+            conf_factors.insert(0, "ema_crossover")
+
+            if conf_score < min_confluence:
+                continue
+
+            signals.append(InducementSignal(
+                entry_index=i, entry_datetime=dt,
+                entry_price=close, direction="long",
+                stop_loss=sl, take_profit=tp,
+                swept_level=ema_slow.iloc[i],
+                signal_type="ema_crossover",
+                confluence_score=conf_score,
+                confluence_factors=conf_factors,
+                session=get_session(dt),
+            ))
+
+        # Bearish crossover: fast crosses below slow
+        elif ema_fast.iloc[i - 1] >= ema_slow.iloc[i - 1] and ema_fast.iloc[i] < ema_slow.iloc[i]:
+            sl = close + (atr_val * 1.5)
+            risk = sl - close
+            tp = close - (risk * rr_ratio)
+
+            dummy_level.price = close
+            dummy_level.kind = "buy_side"
+            conf_score, conf_factors = score_confluence(
+                df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                ema_fast, ema_slow, pip_size)
+            conf_factors = [f for f in conf_factors if f != "trend_aligned"]
+            conf_factors.insert(0, "ema_crossover")
+
+            if conf_score < min_confluence:
+                continue
+
+            signals.append(InducementSignal(
+                entry_index=i, entry_datetime=dt,
+                entry_price=close, direction="short",
+                stop_loss=sl, take_profit=tp,
+                swept_level=ema_slow.iloc[i],
+                signal_type="ema_crossover",
+                confluence_score=conf_score,
+                confluence_factors=conf_factors,
+                session=get_session(dt),
+            ))
+
+    return signals
+
+
+def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
+                        atr: pd.Series = None, fvgs: List[FairValueGap] = None,
+                        obs: List[OrderBlock] = None, rsi: pd.Series = None,
+                        ema_fast: pd.Series = None, ema_slow: pd.Series = None,
+                        min_confluence: int = 0, session_filter: str = "all",
+                        rr_ratio: float = 2.0,
+                        require_displacement: bool = False,
+                        rsi_oversold: float = 30.0, rsi_overbought: float = 70.0,
+                        ) -> List[InducementSignal]:
+    """Detect RSI reversal signals. RSI exits oversold/overbought with confirmation candle."""
+    signals = []
+    if atr is None:
+        atr = calc_atr(df)
+    if rsi is None:
+        rsi = calc_rsi(df)
+    if ema_fast is None:
+        ema_fast = calc_ema(df["Close"], 21)
+    if ema_slow is None:
+        ema_slow = calc_ema(df["Close"], 50)
+    if fvgs is None:
+        fvgs = []
+    if obs is None:
+        obs = []
+
+    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
+                                  formed_at=pd.Timestamp.now())
+
+    for i in range(2, len(df)):
+        if pd.isna(rsi.iloc[i]) or pd.isna(rsi.iloc[i - 1]):
+            continue
+
+        dt = df.index[i]
+        if session_filter != "all":
+            session = get_session(dt)
+            if session != session_filter and session_filter != "killzones":
+                continue
+            if session_filter == "killzones" and not is_in_killzone(dt):
+                continue
+
+        close = df["Close"].iloc[i]
+        open_price = df["Open"].iloc[i]
+        atr_val = atr.iloc[i]
+        if pd.isna(atr_val) or atr_val == 0:
+            continue
+
+        # Bullish: RSI was oversold, now crossing back up + bullish candle
+        if (rsi.iloc[i - 1] < rsi_oversold and rsi.iloc[i] >= rsi_oversold
+                and close > open_price):
+            sl = df["Low"].iloc[i] - (5 * pip_size)
+            risk = close - sl
+            if risk <= 0:
+                continue
+            tp = close + (risk * rr_ratio)
+
+            dummy_level.price = df["Low"].iloc[i]
+            dummy_level.kind = "sell_side"
+            conf_score, conf_factors = score_confluence(
+                df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                ema_fast, ema_slow, pip_size)
+            conf_factors.insert(0, "rsi_reversal")
+
+            if conf_score < min_confluence:
+                continue
+
+            signals.append(InducementSignal(
+                entry_index=i, entry_datetime=dt,
+                entry_price=close, direction="long",
+                stop_loss=sl, take_profit=tp,
+                swept_level=df["Low"].iloc[i],
+                signal_type="rsi_reversal",
+                confluence_score=conf_score,
+                confluence_factors=conf_factors,
+                session=get_session(dt),
+            ))
+
+        # Bearish: RSI was overbought, now crossing back down + bearish candle
+        elif (rsi.iloc[i - 1] > rsi_overbought and rsi.iloc[i] <= rsi_overbought
+              and close < open_price):
+            sl = df["High"].iloc[i] + (5 * pip_size)
+            risk = sl - close
+            if risk <= 0:
+                continue
+            tp = close - (risk * rr_ratio)
+
+            dummy_level.price = df["High"].iloc[i]
+            dummy_level.kind = "buy_side"
+            conf_score, conf_factors = score_confluence(
+                df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                ema_fast, ema_slow, pip_size)
+            conf_factors.insert(0, "rsi_reversal")
+
+            if conf_score < min_confluence:
+                continue
+
+            signals.append(InducementSignal(
+                entry_index=i, entry_datetime=dt,
+                entry_price=close, direction="short",
+                stop_loss=sl, take_profit=tp,
+                swept_level=df["High"].iloc[i],
+                signal_type="rsi_reversal",
+                confluence_score=conf_score,
+                confluence_factors=conf_factors,
+                session=get_session(dt),
+            ))
+
+    return signals
+
+
+def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
+                    pip_size: float = 0.0001,
+                    atr: pd.Series = None, fvgs: List[FairValueGap] = None,
+                    obs: List[OrderBlock] = None, rsi: pd.Series = None,
+                    ema_fast: pd.Series = None, ema_slow: pd.Series = None,
+                    min_confluence: int = 0, session_filter: str = "all",
+                    rr_ratio: float = 2.0,
+                    require_displacement: bool = False,
+                    ) -> List[InducementSignal]:
+    """Detect breakout signals. Close above swing high or below swing low with momentum."""
+    signals = []
+    if atr is None:
+        atr = calc_atr(df)
+    if rsi is None:
+        rsi = calc_rsi(df)
+    if ema_fast is None:
+        ema_fast = calc_ema(df["Close"], 21)
+    if ema_slow is None:
+        ema_slow = calc_ema(df["Close"], 50)
+    if fvgs is None:
+        fvgs = []
+    if obs is None:
+        obs = []
+
+    swing_highs = [s for s in swings if s.kind == "high"]
+    swing_lows = [s for s in swings if s.kind == "low"]
+
+    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
+                                  formed_at=pd.Timestamp.now())
+
+    for i in range(2, len(df)):
+        dt = df.index[i]
+        if session_filter != "all":
+            session = get_session(dt)
+            if session != session_filter and session_filter != "killzones":
+                continue
+            if session_filter == "killzones" and not is_in_killzone(dt):
+                continue
+
+        close = df["Close"].iloc[i]
+        prev_close = df["Close"].iloc[i - 1]
+        atr_val = atr.iloc[i]
+        if pd.isna(atr_val) or atr_val == 0:
+            continue
+
+        body = abs(close - df["Open"].iloc[i])
+
+        # Bullish breakout: close above recent swing high with strong candle
+        for sh in swing_highs:
+            if sh.index < i - 30 or sh.index >= i - 1:
+                continue
+            if prev_close <= sh.price and close > sh.price and body > atr_val * 0.8:
+                sl = sh.price - (atr_val * 0.5)
+                risk = close - sl
+                if risk <= 0:
+                    continue
+                tp = close + (risk * rr_ratio)
+
+                dummy_level.price = sh.price
+                dummy_level.kind = "buy_side"
+                conf_score, conf_factors = score_confluence(
+                    df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                    ema_fast, ema_slow, pip_size)
+                conf_factors.insert(0, "breakout")
+
+                if conf_score < min_confluence:
+                    continue
+
+                signals.append(InducementSignal(
+                    entry_index=i, entry_datetime=dt,
+                    entry_price=close, direction="long",
+                    stop_loss=sl, take_profit=tp,
+                    swept_level=sh.price,
+                    signal_type="breakout",
+                    confluence_score=conf_score,
+                    confluence_factors=conf_factors,
+                    session=get_session(dt),
+                ))
+                break
+
+        # Bearish breakout: close below recent swing low
+        for sl_point in swing_lows:
+            if sl_point.index < i - 30 or sl_point.index >= i - 1:
+                continue
+            if prev_close >= sl_point.price and close < sl_point.price and body > atr_val * 0.8:
+                sl = sl_point.price + (atr_val * 0.5)
+                risk = sl - close
+                if risk <= 0:
+                    continue
+                tp = close - (risk * rr_ratio)
+
+                dummy_level.price = sl_point.price
+                dummy_level.kind = "sell_side"
+                conf_score, conf_factors = score_confluence(
+                    df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                    ema_fast, ema_slow, pip_size)
+                conf_factors.insert(0, "breakout")
+
+                if conf_score < min_confluence:
+                    continue
+
+                signals.append(InducementSignal(
+                    entry_index=i, entry_datetime=dt,
+                    entry_price=close, direction="short",
+                    stop_loss=sl, take_profit=tp,
+                    swept_level=sl_point.price,
+                    signal_type="breakout",
+                    confluence_score=conf_score,
+                    confluence_factors=conf_factors,
+                    session=get_session(dt),
+                ))
+                break
+
+    return signals
+
+
+def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
+                     atr: pd.Series = None, fvgs: List[FairValueGap] = None,
+                     obs: List[OrderBlock] = None, rsi: pd.Series = None,
+                     ema_fast: pd.Series = None, ema_slow: pd.Series = None,
+                     min_confluence: int = 0, session_filter: str = "all",
+                     rr_ratio: float = 2.0,
+                     require_displacement: bool = False,
+                     ) -> List[InducementSignal]:
+    """Detect FVG fill entries. Price retraces into a Fair Value Gap and reverses."""
+    signals = []
+    if atr is None:
+        atr = calc_atr(df)
+    if fvgs is None:
+        fvgs = find_fvgs(df, pip_size=pip_size)
+    if rsi is None:
+        rsi = calc_rsi(df)
+    if ema_fast is None:
+        ema_fast = calc_ema(df["Close"], 21)
+    if ema_slow is None:
+        ema_slow = calc_ema(df["Close"], 50)
+    if obs is None:
+        obs = []
+
+    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
+                                  formed_at=pd.Timestamp.now())
+
+    for fvg in fvgs:
+        # Look for price to retrace into the FVG within 20 candles
+        for i in range(fvg.index + 2, min(fvg.index + 20, len(df))):
+            dt = df.index[i]
+            if session_filter != "all":
+                session = get_session(dt)
+                if session != session_filter and session_filter != "killzones":
+                    continue
+                if session_filter == "killzones" and not is_in_killzone(dt):
+                    continue
+
+            close = df["Close"].iloc[i]
+            open_price = df["Open"].iloc[i]
+            atr_val = atr.iloc[i]
+            if pd.isna(atr_val) or atr_val == 0:
+                continue
+
+            if fvg.direction == "bullish":
+                # Price dips into bullish FVG and closes bullish
+                if df["Low"].iloc[i] <= fvg.top and close >= fvg.bottom and close > open_price:
+                    sl = fvg.bottom - (5 * pip_size)
+                    risk = close - sl
+                    if risk <= 0:
+                        continue
+                    tp = close + (risk * rr_ratio)
+
+                    dummy_level.price = fvg.bottom
+                    dummy_level.kind = "sell_side"
+                    conf_score, conf_factors = score_confluence(
+                        df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                        ema_fast, ema_slow, pip_size)
+                    conf_factors.insert(0, "fvg_entry")
+
+                    if conf_score < min_confluence:
+                        continue
+
+                    signals.append(InducementSignal(
+                        entry_index=i, entry_datetime=dt,
+                        entry_price=close, direction="long",
+                        stop_loss=sl, take_profit=tp,
+                        swept_level=fvg.bottom,
+                        signal_type="fvg_entry",
+                        confluence_score=conf_score,
+                        confluence_factors=conf_factors,
+                        session=get_session(dt),
+                    ))
+                    break  # Only one entry per FVG
+
+            elif fvg.direction == "bearish":
+                # Price rallies into bearish FVG and closes bearish
+                if df["High"].iloc[i] >= fvg.bottom and close <= fvg.top and close < open_price:
+                    sl = fvg.top + (5 * pip_size)
+                    risk = sl - close
+                    if risk <= 0:
+                        continue
+                    tp = close - (risk * rr_ratio)
+
+                    dummy_level.price = fvg.top
+                    dummy_level.kind = "buy_side"
+                    conf_score, conf_factors = score_confluence(
+                        df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                        ema_fast, ema_slow, pip_size)
+                    conf_factors.insert(0, "fvg_entry")
+
+                    if conf_score < min_confluence:
+                        continue
+
+                    signals.append(InducementSignal(
+                        entry_index=i, entry_datetime=dt,
+                        entry_price=close, direction="short",
+                        stop_loss=sl, take_profit=tp,
+                        swept_level=fvg.top,
+                        signal_type="fvg_entry",
+                        confluence_score=conf_score,
+                        confluence_factors=conf_factors,
+                        session=get_session(dt),
+                    ))
+                    break
+
+    return signals
+
+
+def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
+                     atr: pd.Series = None, fvgs: List[FairValueGap] = None,
+                     obs: List[OrderBlock] = None, rsi: pd.Series = None,
+                     ema_fast: pd.Series = None, ema_slow: pd.Series = None,
+                     min_confluence: int = 0, session_filter: str = "all",
+                     rr_ratio: float = 2.0,
+                     require_displacement: bool = False,
+                     ) -> List[InducementSignal]:
+    """Detect Order Block bounce entries. Price returns to an OB zone and reverses."""
+    signals = []
+    if atr is None:
+        atr = calc_atr(df)
+    if obs is None:
+        obs = find_order_blocks(df, pip_size=pip_size)
+    if rsi is None:
+        rsi = calc_rsi(df)
+    if ema_fast is None:
+        ema_fast = calc_ema(df["Close"], 21)
+    if ema_slow is None:
+        ema_slow = calc_ema(df["Close"], 50)
+    if fvgs is None:
+        fvgs = []
+
+    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
+                                  formed_at=pd.Timestamp.now())
+
+    for ob in obs:
+        if ob.mitigated:
+            continue
+        # Look for price to retrace into OB within 30 candles
+        for i in range(ob.index + 2, min(ob.index + 30, len(df))):
+            dt = df.index[i]
+            if session_filter != "all":
+                session = get_session(dt)
+                if session != session_filter and session_filter != "killzones":
+                    continue
+                if session_filter == "killzones" and not is_in_killzone(dt):
+                    continue
+
+            close = df["Close"].iloc[i]
+            open_price = df["Open"].iloc[i]
+            atr_val = atr.iloc[i]
+            if pd.isna(atr_val) or atr_val == 0:
+                continue
+
+            if ob.direction == "bullish":
+                # Price dips into bullish OB zone and bounces
+                if df["Low"].iloc[i] <= ob.high and close >= ob.low and close > open_price:
+                    sl = ob.low - (5 * pip_size)
+                    risk = close - sl
+                    if risk <= 0:
+                        continue
+                    tp = close + (risk * rr_ratio)
+
+                    dummy_level.price = ob.low
+                    dummy_level.kind = "sell_side"
+                    conf_score, conf_factors = score_confluence(
+                        df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                        ema_fast, ema_slow, pip_size)
+                    conf_factors.insert(0, "ob_bounce")
+
+                    if conf_score < min_confluence:
+                        continue
+
+                    signals.append(InducementSignal(
+                        entry_index=i, entry_datetime=dt,
+                        entry_price=close, direction="long",
+                        stop_loss=sl, take_profit=tp,
+                        swept_level=ob.low,
+                        signal_type="ob_bounce",
+                        confluence_score=conf_score,
+                        confluence_factors=conf_factors,
+                        session=get_session(dt),
+                    ))
+                    ob.mitigated = True
+                    break
+
+            elif ob.direction == "bearish":
+                # Price rallies into bearish OB zone and reverses
+                if df["High"].iloc[i] >= ob.low and close <= ob.high and close < open_price:
+                    sl = ob.high + (5 * pip_size)
+                    risk = sl - close
+                    if risk <= 0:
+                        continue
+                    tp = close - (risk * rr_ratio)
+
+                    dummy_level.price = ob.high
+                    dummy_level.kind = "buy_side"
+                    conf_score, conf_factors = score_confluence(
+                        df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                        ema_fast, ema_slow, pip_size)
+                    conf_factors.insert(0, "ob_bounce")
+
+                    if conf_score < min_confluence:
+                        continue
+
+                    signals.append(InducementSignal(
+                        entry_index=i, entry_datetime=dt,
+                        entry_price=close, direction="short",
+                        stop_loss=sl, take_profit=tp,
+                        swept_level=ob.high,
+                        signal_type="ob_bounce",
+                        confluence_score=conf_score,
+                        confluence_factors=conf_factors,
+                        session=get_session(dt),
+                    ))
+                    ob.mitigated = True
+                    break
+
+    return signals
+
+
 def get_pip_size(pair_name: str) -> float:
     """Return pip size for a currency pair."""
     jpy_pairs = ["USD/JPY", "EUR/JPY", "GBP/JPY", "AUD/JPY", "CAD/JPY", "NZD/JPY",

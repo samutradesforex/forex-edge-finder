@@ -24,6 +24,11 @@ from engine.liquidity import (
     detect_liquidity_sweeps,
     detect_inducement_traps,
     detect_stop_hunts,
+    detect_ema_crossover,
+    detect_rsi_reversal,
+    detect_breakout,
+    detect_fvg_entry,
+    detect_ob_bounce,
     get_pip_size,
     calc_atr,
     calc_rsi,
@@ -485,16 +490,29 @@ def run_backtest(
 
     # Generate signals
     signals = []
-    if strategy in ("sweeps", "both", "all"):
+
+    # SMC / Liquidity strategies
+    if strategy in ("sweeps", "both", "all", "smc"):
         signals.extend(detect_liquidity_sweeps(
             df, levels, min_wick_pips=min_wick_pips, **detect_kwargs))
-    if strategy in ("inducement", "both", "all"):
+    if strategy in ("inducement", "both", "all", "smc"):
         signals.extend(detect_inducement_traps(df, swings, **detect_kwargs))
-    if strategy in ("stop_hunts", "all"):
-        # Stop hunts don't use require_displacement
+    if strategy in ("stop_hunts", "all", "smc"):
         sh_kwargs = {k: v for k, v in detect_kwargs.items()
                      if k != "require_displacement"}
         signals.extend(detect_stop_hunts(df, levels, **sh_kwargs))
+
+    # Common strategies
+    if strategy in ("ema_crossover", "all"):
+        signals.extend(detect_ema_crossover(df, **detect_kwargs))
+    if strategy in ("rsi_reversal", "all"):
+        signals.extend(detect_rsi_reversal(df, **detect_kwargs))
+    if strategy in ("breakout", "all"):
+        signals.extend(detect_breakout(df, swings, **detect_kwargs))
+    if strategy in ("fvg_entry", "all"):
+        signals.extend(detect_fvg_entry(df, **detect_kwargs))
+    if strategy in ("ob_bounce", "all"):
+        signals.extend(detect_ob_bounce(df, **detect_kwargs))
 
     # Sort by time
     signals.sort(key=lambda s: s.entry_index)

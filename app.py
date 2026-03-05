@@ -235,9 +235,16 @@ with st.sidebar:
     if data_source == "Download (yfinance)":
         pair = st.selectbox("Currency pair", list(FOREX_PAIRS.keys()), index=0)
         period = st.selectbox("Period", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
-        interval = st.selectbox("Interval", ["15m", "1h", "4h", "1d"], index=1)
-        interval_map = {"15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d"}
+        interval = st.selectbox("Interval", ["1m", "5m", "15m", "1h", "4h", "1d"], index=3)
+        # yfinance interval mapping (4h not natively supported)
+        interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d"}
         yf_interval = interval_map[interval]
+        # yfinance period limits for intraday data
+        period_limits = {"1m": "7d", "5m": "60d"}
+        if interval in period_limits:
+            max_period = period_limits[interval]
+            period = max_period
+            st.caption(f"Period auto-set to **{max_period}** (yfinance limit for {interval})")
     else:
         uploaded = st.file_uploader("Upload CSV", type=["csv"])
         pair = st.text_input("Pair name (for pip size)", "EUR/USD")
@@ -248,7 +255,22 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### STRATEGY")
 
-    strategy = st.selectbox("Signal type", ["all", "both", "sweeps", "inducement", "stop_hunts"])
+    strategy = st.selectbox("Strategy", [
+        "all", "smc", "sweeps", "inducement", "stop_hunts", "both",
+        "ema_crossover", "rsi_reversal", "breakout", "fvg_entry", "ob_bounce",
+    ], format_func=lambda x: {
+        "all": "All Strategies",
+        "smc": "SMC Only (Sweeps + Inducement + Stop Hunts)",
+        "sweeps": "Liquidity Sweeps",
+        "inducement": "Inducement Traps",
+        "stop_hunts": "Stop Hunts",
+        "both": "Sweeps + Inducement",
+        "ema_crossover": "EMA Crossover (21/50)",
+        "rsi_reversal": "RSI Reversal (30/70)",
+        "breakout": "Swing Breakout",
+        "fvg_entry": "FVG Fill Entry",
+        "ob_bounce": "Order Block Bounce",
+    }.get(x, x))
     swing_lookback = st.slider("Swing lookback", 2, 20, 5)
     use_multi_tf = st.checkbox("Multi-TF swings", value=False,
                                 help="Multiple lookback periods (3,5,8,13)")
