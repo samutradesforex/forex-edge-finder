@@ -2,7 +2,7 @@
 
 import pandas as pd
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 from data.loader import FOREX_PAIRS, fetch_pair
 from engine.backtester import run_backtest, BacktestResult
 
@@ -20,7 +20,7 @@ def scan_all_pairs(
     interval: str = "1h",
     pairs: List[str] = None,
     **backtest_kwargs,
-) -> List[PairScanResult]:
+) -> Tuple[List[PairScanResult], List[str]]:
     """Scan multiple pairs and rank by edge quality.
 
     Args:

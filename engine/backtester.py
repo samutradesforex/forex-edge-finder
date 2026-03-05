@@ -184,22 +184,35 @@ class BacktestResult:
         self.equity_curve = curve
         self.max_drawdown_pips = max_dd
         self.max_drawdown_duration = max_dd_duration
+        # Calculate drawdown percentage relative to peak (or starting equity if
+        # the account never went positive — avoids 0% DD on all-loss sequences)
         if peak > 0:
             self.max_drawdown_pct = (max_dd / peak) * 100
+        elif max_dd > 0:
+            # All-loss case: peak stayed at 0, measure relative to starting equity (0)
+            # Use absolute drawdown as a percentage proxy (pips-based)
+            self.max_drawdown_pct = 100.0
         self.recovery_factor = (self.total_pips / max_dd) if max_dd > 0 else float("inf")
 
-        # Sharpe and Sortino (annualized assuming ~252 trading days)
+        # Sharpe and Sortino — annualize based on actual trade frequency
         if len(pnls) > 1:
             pnl_arr = np.array(pnls)
             mean_pnl = np.mean(pnl_arr)
             std_pnl = np.std(pnl_arr, ddof=1)
+
+            # Estimate trades per year from actual trade timestamps
+            first_trade = self.trades[0].entry_datetime
+            last_trade = self.trades[-1].entry_datetime
+            span_days = max((last_trade - first_trade).total_seconds() / 86400, 1)
+            trades_per_year = len(self.trades) / span_days * 252
+
             if std_pnl > 0:
-                self.sharpe_ratio = (mean_pnl / std_pnl) * np.sqrt(252)
+                self.sharpe_ratio = (mean_pnl / std_pnl) * np.sqrt(trades_per_year)
             downside = pnl_arr[pnl_arr < 0]
             if len(downside) > 0:
                 downside_std = np.std(downside, ddof=1)
                 if downside_std > 0:
-                    self.sortino_ratio = (mean_pnl / downside_std) * np.sqrt(252)
+                    self.sortino_ratio = (mean_pnl / downside_std) * np.sqrt(trades_per_year)
         if max_dd > 0:
             self.calmar_ratio = self.total_pips / max_dd
 
@@ -280,16 +293,9 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
         _high_arr: Pre-extracted High values array (performance optimization)
         _low_arr: Pre-extracted Low values array (performance optimization)
     """
-    spread = spread_pips * pip_size
     entry_price = signal.entry_price
     sl = signal.stop_loss
     tp = signal.take_profit
-
-    # Adjust entry for spread
-    if signal.direction == "long":
-        entry_price += spread / 2
-    else:
-        entry_price -= spread / 2
 
     initial_risk = abs(entry_price - sl)
     if initial_risk == 0:
@@ -331,8 +337,17 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                     partial_closed = True
                     effective_pnl_multiplier = 1.0 - partial_tp_pct
 
-            # Check SL
-            if candle_low <= current_sl:
+            sl_hit = candle_low <= current_sl
+            tp_hit = candle_high >= tp
+
+            # When both SL and TP hit same candle, resolve by distance
+            # from open: the closer level is assumed to be hit first
+            if sl_hit and tp_hit:
+                candle_open = df["Open"].values[j] if "Open" in df.columns else entry_price
+                sl_hit = abs(candle_open - current_sl) <= abs(candle_open - tp)
+                tp_hit = not sl_hit
+
+            if sl_hit:
                 pnl = ((current_sl - entry_price) / pip_size) * effective_pnl_multiplier
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
@@ -356,8 +371,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                     max_adverse_pips=round(max_adverse / pip_size, 1),
                 )
 
-            # Check TP
-            if candle_high >= tp:
+            if tp_hit:
                 pnl = ((tp - entry_price) / pip_size) * effective_pnl_multiplier
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
@@ -401,8 +415,16 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                     partial_closed = True
                     effective_pnl_multiplier = 1.0 - partial_tp_pct
 
-            # Check SL
-            if candle_high >= current_sl:
+            sl_hit = candle_high >= current_sl
+            tp_hit = candle_low <= tp
+
+            # When both SL and TP hit same candle, resolve by distance from open
+            if sl_hit and tp_hit:
+                candle_open = df["Open"].values[j] if "Open" in df.columns else entry_price
+                sl_hit = abs(candle_open - current_sl) <= abs(candle_open - tp)
+                tp_hit = not sl_hit
+
+            if sl_hit:
                 pnl = ((entry_price - current_sl) / pip_size) * effective_pnl_multiplier
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
@@ -426,8 +448,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                     max_adverse_pips=round(max_adverse / pip_size, 1),
                 )
 
-            # Check TP
-            if candle_low <= tp:
+            if tp_hit:
                 pnl = ((entry_price - tp) / pip_size) * effective_pnl_multiplier
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct

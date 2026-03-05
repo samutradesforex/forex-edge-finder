@@ -94,21 +94,25 @@ def simulate_account(
     largest_pos = 0.0
     smallest_pos = float("inf")
 
-    # Pre-calculate Kelly fraction if needed
+    # Kelly fraction will be computed from past trades only (no look-ahead)
     kelly_fraction = 0.0
-    if sizing_mode == "kelly" and trades:
-        wins = [t for t in trades if t.result == "win"]
-        losses = [t for t in trades if t.result == "loss"]
-        if wins and losses:
-            win_rate = len(wins) / len(trades)
-            avg_win = np.mean([t.pnl_pips for t in wins])
-            avg_loss = abs(np.mean([t.pnl_pips for t in losses]))
-            if avg_loss > 0:
-                b = avg_win / avg_loss  # payoff ratio
-                kelly_fraction = (win_rate * b - (1 - win_rate)) / b
-                kelly_fraction = max(0, min(kelly_fraction, max_risk_pct / 100))
+    min_kelly_trades = 20  # minimum trades before Kelly kicks in
 
     for i, trade in enumerate(trades):
+        # Update rolling Kelly fraction from past trades only
+        if sizing_mode == "kelly" and i >= min_kelly_trades:
+            past = trades[:i]
+            past_wins = [t for t in past if t.result == "win"]
+            past_losses = [t for t in past if t.result == "loss"]
+            if past_wins and past_losses:
+                wr = len(past_wins) / len(past)
+                avg_w = np.mean([t.pnl_pips for t in past_wins])
+                avg_l = abs(np.mean([t.pnl_pips for t in past_losses]))
+                if avg_l > 0:
+                    b = avg_w / avg_l
+                    kelly_fraction = (wr * b - (1 - wr)) / b
+                    kelly_fraction = max(0, min(kelly_fraction, max_risk_pct / 100))
+
         # Determine position size
         if sizing_mode == "fixed":
             lot_size = fixed_lot

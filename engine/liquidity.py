@@ -95,9 +95,18 @@ KILLZONES = {
 
 
 def get_session(dt: pd.Timestamp) -> str:
-    """Determine which trading session a timestamp falls in."""
+    """Determine which trading session a timestamp falls in.
+
+    Checks overlap first (most specific), then individual sessions.
+    """
     hour = dt.hour
-    for name, (start, end) in SESSIONS.items():
+    # Check overlap first — it's the most specific
+    lo_start, lo_end = SESSIONS["lo_ny_overlap"]
+    if lo_start <= hour < lo_end:
+        return "lo_ny_overlap"
+    # Then check individual sessions in priority order
+    for name in ("london", "new_york", "asia"):
+        start, end = SESSIONS[name]
         if start <= hour < end:
             return name
     return "off_session"
@@ -175,7 +184,8 @@ def find_liquidity_levels(swings: List[SwingPoint], cluster_pips: float = 10.0,
 
         cluster = [points[0]]
         for p in points[1:]:
-            if abs(p.price - cluster[-1].price) <= cluster_dist:
+            centroid = np.mean([c.price for c in cluster])
+            if abs(p.price - centroid) <= cluster_dist:
                 cluster.append(p)
             else:
                 avg_price = np.mean([c.price for c in cluster])
@@ -1336,11 +1346,14 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
                      require_displacement: bool = False,
                      ) -> List[InducementSignal]:
     """Detect Order Block bounce entries. Price returns to an OB zone and reverses."""
+    import copy
     signals = []
     if atr is None:
         atr = calc_atr(df)
     if obs is None:
         obs = find_order_blocks(df, pip_size=pip_size)
+    # Deep-copy to avoid mutating the caller's list when setting ob.mitigated
+    obs = copy.deepcopy(obs)
     if rsi is None:
         rsi = calc_rsi(df)
     if ema_fast is None:
