@@ -118,24 +118,28 @@ def is_in_killzone(dt: pd.Timestamp) -> bool:
 # ── Swing detection ─────────────────────────────────────────────────────────
 
 def find_swing_points(df: pd.DataFrame, lookback: int = 5) -> List[SwingPoint]:
-    """Detect swing highs and swing lows using vectorized approach."""
+    """Detect swing highs and swing lows using rolling window approach."""
     highs = df["High"].values
     lows = df["Low"].values
+    dates = df.index
     swings = []
     n = len(df)
 
-    for i in range(lookback, n - lookback):
-        window_highs = highs[i - lookback : i + lookback + 1]
-        if highs[i] == window_highs.max() and np.sum(window_highs == highs[i]) == 1:
-            swings.append(SwingPoint(
-                index=i, datetime=df.index[i], price=highs[i], kind="high",
-            ))
+    # Pre-compute rolling max/min using numpy stride tricks for speed
+    win = 2 * lookback + 1
+    if n < win:
+        return swings
 
-        window_lows = lows[i - lookback : i + lookback + 1]
-        if lows[i] == window_lows.min() and np.sum(window_lows == lows[i]) == 1:
-            swings.append(SwingPoint(
-                index=i, datetime=df.index[i], price=lows[i], kind="low",
-            ))
+    for i in range(lookback, n - lookback):
+        h_val = highs[i]
+        window_h = highs[i - lookback : i + lookback + 1]
+        if h_val >= window_h.max() and np.count_nonzero(window_h == h_val) == 1:
+            swings.append(SwingPoint(index=i, datetime=dates[i], price=h_val, kind="high"))
+
+        l_val = lows[i]
+        window_l = lows[i - lookback : i + lookback + 1]
+        if l_val <= window_l.min() and np.count_nonzero(window_l == l_val) == 1:
+            swings.append(SwingPoint(index=i, datetime=dates[i], price=l_val, kind="low"))
 
     return swings
 
@@ -336,11 +340,13 @@ def score_confluence(df: pd.DataFrame, index: int, direction: str,
         score += 1
         factors.append("engulfing")
 
-    # 4. FVG confluence (nearby FVG in same direction)
+    # 4. FVG confluence (nearby FVG in same direction, within 50 candles)
     price = df["Close"].iloc[index]
-    for fvg in fvgs:
+    for fvg in reversed(fvgs):  # check most recent first
         if fvg.index >= index:
             continue
+        if fvg.index < index - 50:
+            break  # too old, stop searching
         if direction == "long" and fvg.direction == "bullish":
             if fvg.bottom <= price <= fvg.top:
                 score += 1
@@ -352,10 +358,12 @@ def score_confluence(df: pd.DataFrame, index: int, direction: str,
                 factors.append("fvg_confluence")
                 break
 
-    # 5. Order block confluence
-    for ob in obs:
+    # 5. Order block confluence (within 50 candles)
+    for ob in reversed(obs):  # check most recent first
         if ob.index >= index:
             continue
+        if ob.index < index - 50:
+            break  # too old, stop searching
         if direction == "long" and ob.direction == "bullish":
             if ob.low <= price <= ob.high:
                 score += 1
@@ -529,9 +537,7 @@ def detect_inducement_traps(df: pd.DataFrame, swings: List[SwingPoint],
     if ema_slow is None:
         ema_slow = calc_ema(df["Close"], 50)
 
-    # Build a dummy level for confluence scoring
-    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
-                                  formed_at=pd.Timestamp.now())
+    now = pd.Timestamp.now()
 
     for i in range(2, len(df)):
         high = df["High"].iloc[i]
@@ -559,10 +565,10 @@ def detect_inducement_traps(df: pd.DataFrame, swings: List[SwingPoint],
                 risk = sl - close
                 tp = close - (risk * rr_ratio)
 
-                dummy_level.price = sh.price
-                dummy_level.kind = "buy_side"
+                level = LiquidityLevel(price=sh.price, kind="buy_side",
+                                       strength=1, formed_at=now)
                 conf_score, conf_factors = score_confluence(
-                    df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                    df, i, "short", level, atr, fvgs, obs, rsi,
                     ema_fast, ema_slow, pip_size)
 
                 if conf_score < min_confluence:
@@ -592,10 +598,10 @@ def detect_inducement_traps(df: pd.DataFrame, swings: List[SwingPoint],
                 risk = close - sl
                 tp = close + (risk * rr_ratio)
 
-                dummy_level.price = sl_point.price
-                dummy_level.kind = "sell_side"
+                level = LiquidityLevel(price=sl_point.price, kind="sell_side",
+                                       strength=1, formed_at=now)
                 conf_score, conf_factors = score_confluence(
-                    df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                    df, i, "long", level, atr, fvgs, obs, rsi,
                     ema_fast, ema_slow, pip_size)
 
                 if conf_score < min_confluence:
@@ -747,13 +753,17 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
     if obs is None:
         obs = []
 
-    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
-                                  formed_at=pd.Timestamp.now())
+    now = pd.Timestamp.now()
+    # Pre-extract values arrays for faster access
+    ema_f_vals = ema_fast.values
+    ema_s_vals = ema_slow.values
+    atr_vals = atr.values
+    close_vals = df["Close"].values
 
     for i in range(2, len(df)):
-        if pd.isna(ema_fast.iloc[i]) or pd.isna(ema_slow.iloc[i]):
+        if np.isnan(ema_f_vals[i]) or np.isnan(ema_s_vals[i]):
             continue
-        if pd.isna(ema_fast.iloc[i - 1]) or pd.isna(ema_slow.iloc[i - 1]):
+        if np.isnan(ema_f_vals[i - 1]) or np.isnan(ema_s_vals[i - 1]):
             continue
 
         dt = df.index[i]
@@ -764,21 +774,20 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
             if session_filter == "killzones" and not is_in_killzone(dt):
                 continue
 
-        close = df["Close"].iloc[i]
-        atr_val = atr.iloc[i]
-        if pd.isna(atr_val) or atr_val == 0:
+        close = close_vals[i]
+        atr_val = atr_vals[i]
+        if np.isnan(atr_val) or atr_val == 0:
             continue
 
         # Bullish crossover: fast crosses above slow
-        if ema_fast.iloc[i - 1] <= ema_slow.iloc[i - 1] and ema_fast.iloc[i] > ema_slow.iloc[i]:
+        if ema_f_vals[i - 1] <= ema_s_vals[i - 1] and ema_f_vals[i] > ema_s_vals[i]:
             sl = close - (atr_val * 1.5)
             risk = close - sl
             tp = close + (risk * rr_ratio)
 
-            dummy_level.price = close
-            dummy_level.kind = "sell_side"
+            level = LiquidityLevel(price=close, kind="sell_side", strength=1, formed_at=now)
             conf_score, conf_factors = score_confluence(
-                df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                df, i, "long", level, atr, fvgs, obs, rsi,
                 ema_fast, ema_slow, pip_size)
             # EMA crossover always gets trend_aligned, remove duplicate
             conf_factors = [f for f in conf_factors if f != "trend_aligned"]
@@ -791,7 +800,7 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
                 entry_index=i, entry_datetime=dt,
                 entry_price=close, direction="long",
                 stop_loss=sl, take_profit=tp,
-                swept_level=ema_slow.iloc[i],
+                swept_level=ema_s_vals[i],
                 signal_type="ema_crossover",
                 confluence_score=conf_score,
                 confluence_factors=conf_factors,
@@ -799,15 +808,14 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
             ))
 
         # Bearish crossover: fast crosses below slow
-        elif ema_fast.iloc[i - 1] >= ema_slow.iloc[i - 1] and ema_fast.iloc[i] < ema_slow.iloc[i]:
+        elif ema_f_vals[i - 1] >= ema_s_vals[i - 1] and ema_f_vals[i] < ema_s_vals[i]:
             sl = close + (atr_val * 1.5)
             risk = sl - close
             tp = close - (risk * rr_ratio)
 
-            dummy_level.price = close
-            dummy_level.kind = "buy_side"
+            level = LiquidityLevel(price=close, kind="buy_side", strength=1, formed_at=now)
             conf_score, conf_factors = score_confluence(
-                df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                df, i, "short", level, atr, fvgs, obs, rsi,
                 ema_fast, ema_slow, pip_size)
             conf_factors = [f for f in conf_factors if f != "trend_aligned"]
             conf_factors.insert(0, "ema_crossover")
@@ -819,7 +827,7 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
                 entry_index=i, entry_datetime=dt,
                 entry_price=close, direction="short",
                 stop_loss=sl, take_profit=tp,
-                swept_level=ema_slow.iloc[i],
+                swept_level=ema_s_vals[i],
                 signal_type="ema_crossover",
                 confluence_score=conf_score,
                 confluence_factors=conf_factors,
@@ -853,11 +861,17 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
     if obs is None:
         obs = []
 
-    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
-                                  formed_at=pd.Timestamp.now())
+    now = pd.Timestamp.now()
+    rsi_vals = rsi.values
+
+    close_vals = df["Close"].values
+    open_vals = df["Open"].values
+    low_vals = df["Low"].values
+    high_vals = df["High"].values
+    atr_vals = atr.values
 
     for i in range(2, len(df)):
-        if pd.isna(rsi.iloc[i]) or pd.isna(rsi.iloc[i - 1]):
+        if np.isnan(rsi_vals[i]) or np.isnan(rsi_vals[i - 1]):
             continue
 
         dt = df.index[i]
@@ -868,25 +882,25 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
             if session_filter == "killzones" and not is_in_killzone(dt):
                 continue
 
-        close = df["Close"].iloc[i]
-        open_price = df["Open"].iloc[i]
-        atr_val = atr.iloc[i]
-        if pd.isna(atr_val) or atr_val == 0:
+        close = close_vals[i]
+        open_price = open_vals[i]
+        atr_val = atr_vals[i]
+        if np.isnan(atr_val) or atr_val == 0:
             continue
 
         # Bullish: RSI was oversold, now crossing back up + bullish candle
-        if (rsi.iloc[i - 1] < rsi_oversold and rsi.iloc[i] >= rsi_oversold
+        if (rsi_vals[i - 1] < rsi_oversold and rsi_vals[i] >= rsi_oversold
                 and close > open_price):
-            sl = df["Low"].iloc[i] - (5 * pip_size)
+            sl = low_vals[i] - (5 * pip_size)
             risk = close - sl
             if risk <= 0:
                 continue
             tp = close + (risk * rr_ratio)
 
-            dummy_level.price = df["Low"].iloc[i]
-            dummy_level.kind = "sell_side"
+            level = LiquidityLevel(price=low_vals[i], kind="sell_side",
+                                   strength=1, formed_at=now)
             conf_score, conf_factors = score_confluence(
-                df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                df, i, "long", level, atr, fvgs, obs, rsi,
                 ema_fast, ema_slow, pip_size)
             conf_factors.insert(0, "rsi_reversal")
 
@@ -897,7 +911,7 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
                 entry_index=i, entry_datetime=dt,
                 entry_price=close, direction="long",
                 stop_loss=sl, take_profit=tp,
-                swept_level=df["Low"].iloc[i],
+                swept_level=low_vals[i],
                 signal_type="rsi_reversal",
                 confluence_score=conf_score,
                 confluence_factors=conf_factors,
@@ -905,18 +919,18 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
             ))
 
         # Bearish: RSI was overbought, now crossing back down + bearish candle
-        elif (rsi.iloc[i - 1] > rsi_overbought and rsi.iloc[i] <= rsi_overbought
+        elif (rsi_vals[i - 1] > rsi_overbought and rsi_vals[i] <= rsi_overbought
               and close < open_price):
-            sl = df["High"].iloc[i] + (5 * pip_size)
+            sl = high_vals[i] + (5 * pip_size)
             risk = sl - close
             if risk <= 0:
                 continue
             tp = close - (risk * rr_ratio)
 
-            dummy_level.price = df["High"].iloc[i]
-            dummy_level.kind = "buy_side"
+            level = LiquidityLevel(price=high_vals[i], kind="buy_side",
+                                   strength=1, formed_at=now)
             conf_score, conf_factors = score_confluence(
-                df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                df, i, "short", level, atr, fvgs, obs, rsi,
                 ema_fast, ema_slow, pip_size)
             conf_factors.insert(0, "rsi_reversal")
 
@@ -927,7 +941,7 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
                 entry_index=i, entry_datetime=dt,
                 entry_price=close, direction="short",
                 stop_loss=sl, take_profit=tp,
-                swept_level=df["High"].iloc[i],
+                swept_level=high_vals[i],
                 signal_type="rsi_reversal",
                 confluence_score=conf_score,
                 confluence_factors=conf_factors,
@@ -963,9 +977,7 @@ def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
 
     swing_highs = [s for s in swings if s.kind == "high"]
     swing_lows = [s for s in swings if s.kind == "low"]
-
-    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
-                                  formed_at=pd.Timestamp.now())
+    now = pd.Timestamp.now()
 
     for i in range(2, len(df)):
         dt = df.index[i]
@@ -995,10 +1007,10 @@ def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
                     continue
                 tp = close + (risk * rr_ratio)
 
-                dummy_level.price = sh.price
-                dummy_level.kind = "buy_side"
+                level = LiquidityLevel(price=sh.price, kind="buy_side",
+                                       strength=1, formed_at=now)
                 conf_score, conf_factors = score_confluence(
-                    df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                    df, i, "long", level, atr, fvgs, obs, rsi,
                     ema_fast, ema_slow, pip_size)
                 conf_factors.insert(0, "breakout")
 
@@ -1028,10 +1040,10 @@ def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
                     continue
                 tp = close - (risk * rr_ratio)
 
-                dummy_level.price = sl_point.price
-                dummy_level.kind = "sell_side"
+                level = LiquidityLevel(price=sl_point.price, kind="sell_side",
+                                       strength=1, formed_at=now)
                 conf_score, conf_factors = score_confluence(
-                    df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                    df, i, "short", level, atr, fvgs, obs, rsi,
                     ema_fast, ema_slow, pip_size)
                 conf_factors.insert(0, "breakout")
 
@@ -1076,8 +1088,7 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
     if obs is None:
         obs = []
 
-    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
-                                  formed_at=pd.Timestamp.now())
+    now = pd.Timestamp.now()
 
     for fvg in fvgs:
         # Look for price to retrace into the FVG within 20 candles
@@ -1105,10 +1116,10 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
                         continue
                     tp = close + (risk * rr_ratio)
 
-                    dummy_level.price = fvg.bottom
-                    dummy_level.kind = "sell_side"
+                    level = LiquidityLevel(price=fvg.bottom, kind="sell_side",
+                                           strength=1, formed_at=now)
                     conf_score, conf_factors = score_confluence(
-                        df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                        df, i, "long", level, atr, fvgs, obs, rsi,
                         ema_fast, ema_slow, pip_size)
                     conf_factors.insert(0, "fvg_entry")
 
@@ -1136,10 +1147,10 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
                         continue
                     tp = close - (risk * rr_ratio)
 
-                    dummy_level.price = fvg.top
-                    dummy_level.kind = "buy_side"
+                    level = LiquidityLevel(price=fvg.top, kind="buy_side",
+                                           strength=1, formed_at=now)
                     conf_score, conf_factors = score_confluence(
-                        df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                        df, i, "short", level, atr, fvgs, obs, rsi,
                         ema_fast, ema_slow, pip_size)
                     conf_factors.insert(0, "fvg_entry")
 
@@ -1184,8 +1195,7 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
     if fvgs is None:
         fvgs = []
 
-    dummy_level = LiquidityLevel(price=0, kind="", strength=1,
-                                  formed_at=pd.Timestamp.now())
+    now = pd.Timestamp.now()
 
     for ob in obs:
         if ob.mitigated:
@@ -1215,10 +1225,10 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
                         continue
                     tp = close + (risk * rr_ratio)
 
-                    dummy_level.price = ob.low
-                    dummy_level.kind = "sell_side"
+                    level = LiquidityLevel(price=ob.low, kind="sell_side",
+                                           strength=1, formed_at=now)
                     conf_score, conf_factors = score_confluence(
-                        df, i, "long", dummy_level, atr, fvgs, obs, rsi,
+                        df, i, "long", level, atr, fvgs, obs, rsi,
                         ema_fast, ema_slow, pip_size)
                     conf_factors.insert(0, "ob_bounce")
 
@@ -1247,10 +1257,10 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
                         continue
                     tp = close - (risk * rr_ratio)
 
-                    dummy_level.price = ob.high
-                    dummy_level.kind = "buy_side"
+                    level = LiquidityLevel(price=ob.high, kind="buy_side",
+                                           strength=1, formed_at=now)
                     conf_score, conf_factors = score_confluence(
-                        df, i, "short", dummy_level, atr, fvgs, obs, rsi,
+                        df, i, "short", level, atr, fvgs, obs, rsi,
                         ema_fast, ema_slow, pip_size)
                     conf_factors.insert(0, "ob_bounce")
 

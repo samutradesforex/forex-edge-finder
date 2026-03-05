@@ -254,6 +254,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                    trailing_sl: bool = False, trailing_activation_rr: float = 1.0,
                    break_even_rr: float = 0.0,
                    partial_tp_rr: float = 0.0, partial_tp_pct: float = 0.5,
+                   _high_arr: np.ndarray = None, _low_arr: np.ndarray = None,
                    ) -> Optional[Trade]:
     """Simulate a single trade with advanced exit logic.
 
@@ -267,6 +268,8 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
         break_even_rr: RR multiple to move SL to break-even (0 = disabled)
         partial_tp_rr: RR multiple for partial take profit (0 = disabled)
         partial_tp_pct: Percentage of position to close at partial TP
+        _high_arr: Pre-extracted High values array (performance optimization)
+        _low_arr: Pre-extracted Low values array (performance optimization)
     """
     spread = spread_pips * pip_size
     entry_price = signal.entry_price
@@ -289,9 +292,14 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
     partial_closed = False
     effective_pnl_multiplier = 1.0
 
-    for j in range(signal.entry_index + 1, len(df)):
-        candle_high = df["High"].iloc[j]
-        candle_low = df["Low"].iloc[j]
+    # Use pre-extracted arrays for speed (avoid .iloc per candle)
+    high_arr = _high_arr if _high_arr is not None else df["High"].values
+    low_arr = _low_arr if _low_arr is not None else df["Low"].values
+    n = len(df)
+
+    for j in range(signal.entry_index + 1, n):
+        candle_high = high_arr[j]
+        candle_low = low_arr[j]
 
         if signal.direction == "long":
             favorable = candle_high - entry_price
@@ -517,6 +525,10 @@ def run_backtest(
     # Sort by time
     signals.sort(key=lambda s: s.entry_index)
 
+    # Pre-extract arrays for simulate_trade performance
+    _high_arr = df["High"].values
+    _low_arr = df["Low"].values
+
     # Filter: one trade at a time, max per day, consecutive loss protection
     trades = []
     last_exit_idx = -1
@@ -551,6 +563,8 @@ def run_backtest(
             break_even_rr=break_even_rr,
             partial_tp_rr=partial_tp_rr,
             partial_tp_pct=partial_tp_pct,
+            _high_arr=_high_arr,
+            _low_arr=_low_arr,
         )
 
         if trade:
@@ -617,6 +631,12 @@ def optimize_parameters(
     param_values = list(param_grid.values())
     combinations = list(product(*param_values))
 
+    def _safe_val(v, cap=100.0):
+        """Clamp inf/NaN to a safe numeric value."""
+        if v != v or v == float("inf") or v == float("-inf"):  # NaN or inf
+            return 0.0
+        return min(v, cap)
+
     results = []
     for combo in combinations:
         params = dict(zip(param_names, combo))
@@ -627,11 +647,15 @@ def optimize_parameters(
             if bt_result.total_trades < 5:
                 continue
 
+            pf = _safe_val(bt_result.profit_factor, 10.0)
+            rf = _safe_val(bt_result.recovery_factor, 20.0)
+            pr = _safe_val(bt_result.payoff_ratio, 10.0)
+
             # Compute optimization score
             if optimize_for == "expectancy":
                 score = bt_result.expectancy_pips
             elif optimize_for == "profit_factor":
-                score = bt_result.profit_factor if bt_result.profit_factor != float("inf") else 0
+                score = pf
             elif optimize_for == "sharpe":
                 score = bt_result.sharpe_ratio
             elif optimize_for == "total_pips":
@@ -639,16 +663,25 @@ def optimize_parameters(
             elif optimize_for == "win_rate":
                 score = bt_result.win_rate
             elif optimize_for == "combined":
-                # Balanced score combining multiple metrics
+                # Normalized balanced score (all components on 0-100 scale)
+                norm_exp = min(max(bt_result.expectancy_pips, -10), 10) * 5  # -50 to 50
+                norm_pf = min(pf, 5) * 10  # 0 to 50
+                norm_sharpe = min(max(bt_result.sharpe_ratio, -2), 5) * 10  # -20 to 50
+                norm_wr = bt_result.win_rate  # 0 to 100
+                norm_rf = min(rf, 10) * 5  # 0 to 50
                 score = (
-                    bt_result.expectancy_pips * 0.3 +
-                    bt_result.profit_factor * 10 * 0.2 +
-                    bt_result.sharpe_ratio * 5 * 0.2 +
-                    bt_result.win_rate * 0.15 +
-                    bt_result.recovery_factor * 5 * 0.15
+                    norm_exp * 0.25 +
+                    norm_pf * 0.25 +
+                    norm_sharpe * 0.20 +
+                    norm_wr * 0.15 +
+                    norm_rf * 0.15
                 )
             else:
                 score = bt_result.expectancy_pips
+
+            # Guard against NaN score
+            if score != score:  # NaN check
+                continue
 
             results.append(OptimizationResult(
                 params=params,
@@ -659,9 +692,9 @@ def optimize_parameters(
                 max_drawdown=bt_result.max_drawdown_pips,
                 sharpe_ratio=bt_result.sharpe_ratio,
                 expectancy=bt_result.expectancy_pips,
-                score=score,
+                score=round(score, 2),
             ))
-        except Exception:
+        except (ValueError, KeyError, IndexError):
             continue
 
     # Sort by score descending

@@ -58,7 +58,7 @@ def scan_all_pairs(
             results.append(PairScanResult(
                 pair=pair_name, backtest=bt, edge_score=round(edge, 1),
             ))
-        except Exception:
+        except (ValueError, KeyError, IndexError):
             continue
 
     results.sort(key=lambda r: r.edge_score, reverse=True)

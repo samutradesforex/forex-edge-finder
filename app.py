@@ -18,7 +18,6 @@ from engine.scanner import scan_all_pairs, scan_summary_df
 
 st.set_page_config(
     page_title="Forex Edge Finder",
-    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -332,15 +331,21 @@ tab_results, tab_analysis, tab_account, tab_chart, tab_trades, tab_optimize, tab
 ])
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def _fetch_cached(pair_name: str, period: str, yf_interval: str, interval: str):
+    """Cached data download — avoids re-downloading on every rerun."""
+    df = fetch_pair(pair_name, period=period, interval=yf_interval)
+    if interval == "4h" and yf_interval == "1h":
+        df = df.resample("4h").agg({
+            "Open": "first", "High": "max", "Low": "min", "Close": "last"
+        }).dropna()
+    return df
+
+
 def load_data():
     """Load price data based on user selection."""
     if data_source == "Download (yfinance)":
-        df = fetch_pair(pair, period=period, interval=yf_interval)
-        if interval == "4h" and yf_interval == "1h":
-            df = df.resample("4h").agg({
-                "Open": "first", "High": "max", "Low": "min", "Close": "last"
-            }).dropna()
-        return df
+        return _fetch_cached(pair, period, yf_interval, interval)
     else:
         if uploaded is None:
             st.error("Please upload a CSV file.")
@@ -420,10 +425,10 @@ if run_btn or optimize_btn:
             st.error(f"Failed to load data: {e}")
             st.stop()
 
-    st.toast(f"Loaded {len(df)} candles for {pair} ({interval})", icon="")
+    st.toast(f"Loaded {len(df)} candles for {pair} ({interval})")
 
     if run_btn:
-        # Structure filter
+        # Structure filter (always define for Chart tab reuse)
         structure_breaks = None
         if use_structure_filter:
             _, structure_breaks, _ = compute_structure(df, swing_lookback=swing_lookback)
@@ -855,13 +860,18 @@ if run_btn or optimize_btn:
                             textposition="outside", textfont=dict(size=9),
                         ))
                         # Session zone shading
-                        h_fig.add_vrect(x0=-0.5, x1=7.5, fillcolor="rgba(88,166,255,0.04)",
-                                        line_width=0, annotation_text="Asia",
-                                        annotation_position="top left",
-                                        annotation_font_color="#484f58")
-                        london_start = [f"{h:02d}" for h in hours].index("08") if "08" in [f"{h:02d}" for h in hours] else None
-                        if london_start is not None:
-                            h_fig.add_vrect(x0=london_start - 0.5, x1=london_start + 8.5,
+                        hour_labels = [f"{h:02d}" for h in hours]
+                        if "00" in hour_labels:
+                            asia_end = hour_labels.index("08") if "08" in hour_labels else len(hour_labels)
+                            h_fig.add_vrect(x0=-0.5, x1=asia_end - 0.5,
+                                            fillcolor="rgba(88,166,255,0.04)",
+                                            line_width=0, annotation_text="Asia",
+                                            annotation_position="top left",
+                                            annotation_font_color="#484f58")
+                        if "08" in hour_labels:
+                            london_start = hour_labels.index("08")
+                            london_end = min(london_start + 8, len(hour_labels) - 1)
+                            h_fig.add_vrect(x0=london_start - 0.5, x1=london_end + 0.5,
                                             fillcolor="rgba(63,185,80,0.04)", line_width=0,
                                             annotation_text="London",
                                             annotation_position="top left",
@@ -1244,11 +1254,15 @@ if run_btn or optimize_btn:
             else:
                 section(f"Price Chart — {pair} {interval.upper()}")
                 pip_size = get_pip_size(pair)
+                # Reuse structure from filter if available, otherwise compute once
+                if use_structure_filter and structure_breaks:
+                    str_breaks = structure_breaks
+                else:
+                    _, str_breaks, _ = compute_structure(df, swing_lookback=swing_lookback)
                 swings = find_swing_points(df, lookback=swing_lookback)
                 levels = find_liquidity_levels(swings, cluster_pips=cluster_pips,
                                                pip_size=pip_size)
                 fvg_list = find_fvgs(df, pip_size=pip_size)
-                _, str_breaks, _ = compute_structure(df, swing_lookback=swing_lookback)
 
                 # Chart options
                 opt1, opt2, opt3, opt4 = st.columns(4)
