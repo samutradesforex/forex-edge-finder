@@ -19,7 +19,7 @@ from engine.scanner import scan_all_pairs, scan_summary_df
 st.set_page_config(
     page_title="Forex Edge Finder",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ── Professional dark theme ─────────────────────────────────────────────────
@@ -142,6 +142,120 @@ st.markdown("""
         text-transform: uppercase;
         letter-spacing: 0.8px;
     }
+
+    /* ── Mobile responsive ── */
+    @media (max-width: 768px) {
+        .block-container { padding: 0.5rem 0.8rem !important; }
+
+        /* Header */
+        .hub-header { padding: 0.8rem 1rem; margin-bottom: 0.8rem; }
+        .hub-title { font-size: 1.15rem; }
+        .hub-subtitle { font-size: 0.72rem; }
+
+        /* Metric cards: stack in 2-col grid on mobile */
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 6px !important;
+        }
+        [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+            flex: 1 1 calc(50% - 6px) !important;
+            min-width: calc(50% - 6px) !important;
+            max-width: calc(50% - 6px) !important;
+        }
+        [data-testid="stMetric"] {
+            padding: 8px 10px;
+            border-radius: 8px;
+        }
+        [data-testid="stMetric"] label {
+            font-size: 0.65rem !important;
+            letter-spacing: 0.2px;
+        }
+        [data-testid="stMetric"] [data-testid="stMetricValue"] {
+            font-size: 1rem !important;
+        }
+
+        /* Section headers */
+        .section-header {
+            font-size: 0.92rem;
+            padding: 0.4rem 0 0.3rem 0;
+            margin-bottom: 0.5rem;
+        }
+
+        /* Tabs: scrollable horizontal on mobile */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 2px;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: none;
+            flex-wrap: nowrap !important;
+        }
+        .stTabs [data-baseweb="tab-list"]::-webkit-scrollbar { display: none; }
+        .stTabs [data-baseweb="tab"] {
+            padding: 6px 10px;
+            font-size: 0.78rem;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        /* Edge badge row */
+        div[style*="display:flex"][style*="gap:16px"] {
+            flex-wrap: wrap !important;
+            gap: 8px !important;
+        }
+        .edge-badge { font-size: 0.75rem; padding: 3px 10px; }
+
+        /* Charts: ensure proper sizing */
+        .js-plotly-plot { width: 100% !important; }
+        .plotly .main-svg { max-width: 100% !important; }
+
+        /* Data tables: horizontal scroll */
+        .stDataFrame { overflow-x: auto !important; }
+        .stDataFrame table { font-size: 0.75rem !important; }
+
+        /* Sidebar on mobile: full width overlay */
+        section[data-testid="stSidebar"] > div {
+            width: 85vw !important;
+            max-width: 340px;
+        }
+
+        /* Landing page */
+        div[style*="font-size:2.5rem"] { font-size: 1.5rem !important; }
+    }
+
+    /* ── Small phone (< 480px) ── */
+    @media (max-width: 480px) {
+        .block-container { padding: 0.3rem 0.5rem !important; }
+        .hub-header { padding: 0.6rem 0.7rem; }
+        .hub-title { font-size: 1rem; }
+        .hub-subtitle { font-size: 0.65rem; }
+
+        /* Stack metrics 2-col */
+        [data-testid="stMetric"] { padding: 6px 8px; }
+        [data-testid="stMetric"] [data-testid="stMetricValue"] {
+            font-size: 0.88rem !important;
+        }
+        [data-testid="stMetric"] label {
+            font-size: 0.58rem !important;
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            padding: 5px 8px;
+            font-size: 0.7rem;
+        }
+
+        .section-header { font-size: 0.85rem; }
+    }
+
+    /* ── Tablet (768px - 1024px) ── */
+    @media (min-width: 769px) and (max-width: 1024px) {
+        .hub-title { font-size: 1.35rem; }
+
+        /* 3-col metrics on tablet */
+        [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+            flex: 1 1 calc(33.33% - 8px) !important;
+            min-width: calc(33.33% - 8px) !important;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -211,10 +325,11 @@ CHART_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(13,17,23,0.8)",
     font=dict(color="#8b949e", size=11),
-    margin=dict(l=20, r=20, t=30, b=20),
+    margin=dict(l=10, r=10, t=30, b=20),
     xaxis=dict(gridcolor="rgba(48,54,61,0.5)", zeroline=False),
     yaxis=dict(gridcolor="rgba(48,54,61,0.5)", zeroline=False),
     legend=dict(bgcolor="rgba(0,0,0,0)"),
+    autosize=True,
 )
 
 GREEN = "#3fb950"
@@ -1537,10 +1652,13 @@ if run_btn or optimize_btn:
 elif not run_btn and not optimize_btn and not scan_btn:
     with tab_results:
         st.markdown("""
-        <div style="text-align:center; padding:2rem 0;">
-            <div style="font-size:2.5rem; margin-bottom:0.5rem;">FOREX EDGE FINDER</div>
-            <div style="color:#8b949e; font-size:1rem; margin-bottom:2rem;">
-                Configure your strategy in the sidebar, then click <b>RUN BACKTEST</b>
+        <div style="text-align:center; padding:1.5rem 0;">
+            <div class="landing-title" style="font-size:2.2rem; margin-bottom:0.5rem;
+                 background:linear-gradient(90deg,#58a6ff,#3fb950,#ffd700);
+                 -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+                 font-weight:700;">FOREX EDGE FINDER</div>
+            <div style="color:#8b949e; font-size:0.95rem; margin-bottom:1.5rem;">
+                Open the sidebar to configure your strategy, then click <b>RUN BACKTEST</b>
             </div>
         </div>
         """, unsafe_allow_html=True)
