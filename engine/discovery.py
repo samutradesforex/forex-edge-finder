@@ -27,7 +27,7 @@ from typing import List, Dict, Optional, Callable
 import pandas as pd
 import numpy as np
 
-from data.loader import FOREX_PAIRS, fetch_pair
+from data.loader import FOREX_PAIRS, fetch_pair, fetch_max_data
 from engine.backtester import run_backtest, BacktestResult
 from engine.liquidity import (
     get_pip_size, calc_atr, calc_rsi, calc_ema, find_fvgs, find_order_blocks,
@@ -374,16 +374,24 @@ def _count_total_combos(strategies: List[str], intervals: List[str],
 
 # ── Core discovery loop ───────────────────────────────────────────────────
 
-def _fetch_data(pair: str, period: str, interval: str) -> Optional[pd.DataFrame]:
-    """Fetch data for a pair/interval, handling the 4h resample."""
+def _fetch_data(pair: str, period: str, interval: str,
+                use_max: bool = False) -> Optional[pd.DataFrame]:
+    """Fetch data for a pair/interval, handling the 4h resample.
+
+    Args:
+        use_max: If True, fetch maximum available history (better for discovery)
+    """
     try:
-        yf_interval = "1h" if interval == "4h" else interval
-        df = fetch_pair(pair, period=period, interval=yf_interval)
-        if interval == "4h":
-            agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-            if "Volume" in df.columns:
-                agg["Volume"] = "sum"
-            df = df.resample("4h").agg(agg).dropna()
+        if use_max:
+            df = fetch_max_data(pair, interval)
+        else:
+            yf_interval = "1h" if interval == "4h" else interval
+            df = fetch_pair(pair, period=period, interval=yf_interval)
+            if interval == "4h":
+                agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+                if "Volume" in df.columns:
+                    agg["Volume"] = "sum"
+                df = df.resample("4h").agg(agg).dropna()
         if len(df) < 50:
             logger.warning("Insufficient data for %s %s: %d rows", pair, interval, len(df))
             return None
@@ -497,7 +505,7 @@ def run_discovery(
                         state.combos_tested += len(combos)
                     continue
 
-            df = _fetch_data(pair, period, intv)
+            df = _fetch_data(pair, period, intv, use_max=True)
             if df is None:
                 for strat in strategies:
                     combos = _get_strategy_combos(strat, param_grid)

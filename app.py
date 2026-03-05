@@ -6,7 +6,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from data.loader import fetch_pair, load_csv, FOREX_PAIRS
+from data.loader import fetch_pair, fetch_max_data, load_csv, FOREX_PAIRS, get_cache_stats
 from engine.liquidity import (
     find_swing_points, find_multi_tf_swings, find_liquidity_levels,
     find_fvgs, find_order_blocks, get_pip_size, calc_atr, calc_rsi, calc_ema,
@@ -454,13 +454,14 @@ tab_results, tab_analysis, tab_account, tab_chart, tab_trades, tab_optimize, tab
 
 @st.cache_data(show_spinner=False, ttl=300)
 def _fetch_cached(pair_name: str, period: str, yf_interval: str, interval: str):
-    """Cached data download — avoids re-downloading on every rerun."""
-    df = fetch_pair(pair_name, period=period, interval=yf_interval)
-    if interval == "4h" and yf_interval == "1h":
-        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-        if "Volume" in df.columns:
-            agg["Volume"] = "sum"
-        df = df.resample("4h").agg(agg).dropna()
+    """Cached data download — uses shared 1h→4h resampling from loader."""
+    if interval == "4h":
+        # Use loader's built-in 4h resample (shares cache with 1h)
+        from data.loader import _resample_4h
+        df = fetch_pair(pair_name, period=period, interval="1h")
+        df = _resample_4h(df)
+    else:
+        df = fetch_pair(pair_name, period=period, interval=yf_interval)
     return df
 
 
