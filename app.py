@@ -631,21 +631,161 @@ if run_btn or optimize_btn:
             if not result.trades:
                 st.info("Run a backtest to see analytics.")
             else:
-                # Monthly PnL heatmap-style bars
+                # ── Quick stats summary row ──
+                pnls = [t.pnl_pips for t in result.trades]
+                wins_list = [t for t in result.trades if t.result == "win"]
+                losses_list = [t for t in result.trades if t.result == "loss"]
+                avg_pnl = np.mean(pnls)
+                pnl_std = np.std(pnls) if len(pnls) > 1 else 0
+                median_pnl = np.median(pnls)
+                win_pnls = [t.pnl_pips for t in wins_list]
+                loss_pnls = [t.pnl_pips for t in losses_list]
+                avg_hold = np.mean([t.holding_candles for t in result.trades])
+
+                # Consistency score: measures how stable returns are
+                if len(pnls) >= 10:
+                    rolling_n = max(5, len(pnls) // 5)
+                    chunks = [pnls[i:i+rolling_n] for i in range(0, len(pnls), rolling_n)]
+                    chunk_means = [np.mean(c) for c in chunks if len(c) >= 3]
+                    profitable_chunks = sum(1 for m in chunk_means if m > 0)
+                    consistency = (profitable_chunks / len(chunk_means) * 100) if chunk_means else 0
+                else:
+                    consistency = 0
+
+                section("Analytics Summary")
+                s1, s2, s3, s4, s5, s6 = st.columns(6)
+                s1.metric("Avg PnL/Trade", f"{avg_pnl:+.1f} p")
+                s2.metric("Median PnL", f"{median_pnl:+.1f} p")
+                s3.metric("Std Dev", f"{pnl_std:.1f} p")
+                s4.metric("Avg Hold", f"{avg_hold:.0f} bars")
+                s5.metric("Consistency", f"{consistency:.0f}%")
+                s6.metric("Avg Win/Loss",
+                           f"{np.mean(win_pnls):.0f}/{np.mean(loss_pnls):.0f}" if win_pnls and loss_pnls else "---")
+
+                # ── Cumulative P&L + Rolling Win Rate (dual chart) ──
+                section("Cumulative Performance")
+                cum_pnl = np.cumsum(pnls)
+                rolling_window = min(10, max(3, len(pnls) // 5))
+
+                perf_fig = make_subplots(specs=[[{"secondary_y": True}]])
+                perf_fig.add_trace(go.Scatter(
+                    y=cum_pnl.tolist(), mode="lines",
+                    line=dict(color=GREEN, width=2), name="Cum. PnL",
+                    fill="tozeroy", fillcolor="rgba(63,185,80,0.06)",
+                ), secondary_y=False)
+
+                # Rolling win rate
+                results_binary = [1 if t.result == "win" else 0 for t in result.trades]
+                if len(results_binary) >= rolling_window:
+                    rolling_wr = pd.Series(results_binary).rolling(rolling_window).mean() * 100
+                    perf_fig.add_trace(go.Scatter(
+                        y=rolling_wr.tolist(), mode="lines",
+                        line=dict(color=GOLD, width=1.5, dash="dot"),
+                        name=f"Win Rate ({rolling_window}-trade rolling)",
+                    ), secondary_y=True)
+                    perf_fig.add_hline(y=50, line_dash="dot",
+                                       line_color="rgba(139,148,158,0.3)",
+                                       secondary_y=True)
+
+                perf_fig.update_layout(**CHART_LAYOUT, height=340,
+                                        xaxis_title="Trade #",
+                                        legend=dict(orientation="h", yanchor="bottom",
+                                                    y=1.02, bgcolor="rgba(0,0,0,0)"))
+                perf_fig.update_yaxes(title_text="Cumulative Pips", secondary_y=False,
+                                       gridcolor="rgba(48,54,61,0.5)")
+                perf_fig.update_yaxes(title_text="Rolling Win Rate %", secondary_y=True,
+                                       showgrid=False, range=[0, 100])
+                st.plotly_chart(perf_fig, use_container_width=True)
+
+                # ── Running expectancy ──
+                section("Running Expectancy")
+                if len(pnls) >= 5:
+                    running_exp = [np.mean(pnls[:i+1]) for i in range(len(pnls))]
+                    exp_fig = go.Figure()
+                    exp_fig.add_trace(go.Scatter(
+                        y=running_exp, mode="lines",
+                        line=dict(color=CYAN, width=2), name="Expectancy",
+                        fill="tozeroy",
+                        fillcolor="rgba(121,192,255,0.06)",
+                    ))
+                    exp_fig.add_hline(y=0, line_color="#484f58", line_width=1)
+                    # Mark where expectancy stabilizes (last 20% avg)
+                    stable_start = max(5, int(len(running_exp) * 0.8))
+                    stable_exp = np.mean(running_exp[stable_start:])
+                    exp_fig.add_hline(y=stable_exp, line_dash="dot", line_color=GOLD,
+                                       annotation_text=f"Stable: {stable_exp:+.1f}p",
+                                       annotation_font_color=GOLD)
+                    exp_fig.update_layout(**CHART_LAYOUT, height=250,
+                                           xaxis_title="Trade #",
+                                           yaxis_title="Avg Pips/Trade")
+                    st.plotly_chart(exp_fig, use_container_width=True)
+
+                # ── Monthly PnL ──
                 section("Monthly P&L")
                 if result.monthly_pnl:
                     months = sorted(result.monthly_pnl.keys())
                     monthly_vals = [result.monthly_pnl[m] for m in months]
-                    m_fig = go.Figure(go.Bar(
+
+                    # Monthly trades count
+                    monthly_trades = {}
+                    for t in result.trades:
+                        m_key = t.entry_datetime.strftime("%Y-%m")
+                        monthly_trades[m_key] = monthly_trades.get(m_key, 0) + 1
+
+                    m_fig = make_subplots(specs=[[{"secondary_y": True}]])
+                    m_fig.add_trace(go.Bar(
                         x=months, y=monthly_vals,
                         marker_color=[GREEN if v >= 0 else RED for v in monthly_vals],
                         text=[f"{v:+.0f}" for v in monthly_vals],
                         textposition="outside", textfont=dict(size=10),
-                    ))
-                    m_fig.update_layout(**CHART_LAYOUT, height=300, yaxis_title="Pips")
+                        name="Net Pips",
+                    ), secondary_y=False)
+
+                    # Overlay trade count
+                    m_counts = [monthly_trades.get(m, 0) for m in months]
+                    m_fig.add_trace(go.Scatter(
+                        x=months, y=m_counts, mode="lines+markers",
+                        line=dict(color=CYAN, width=1.5), marker=dict(size=5),
+                        name="Trades",
+                    ), secondary_y=True)
+
+                    m_fig.update_layout(**CHART_LAYOUT, height=320,
+                                        legend=dict(orientation="h", yanchor="bottom",
+                                                    y=1.02, bgcolor="rgba(0,0,0,0)"))
+                    m_fig.update_yaxes(title_text="Pips", secondary_y=False,
+                                        gridcolor="rgba(48,54,61,0.5)")
+                    m_fig.update_yaxes(title_text="# Trades", secondary_y=True,
+                                        showgrid=False)
                     st.plotly_chart(m_fig, use_container_width=True)
 
-                # Day + Hour side by side
+                    # Monthly stats table
+                    monthly_win_data = {}
+                    for t in result.trades:
+                        m_key = t.entry_datetime.strftime("%Y-%m")
+                        if m_key not in monthly_win_data:
+                            monthly_win_data[m_key] = {"wins": 0, "total": 0}
+                        monthly_win_data[m_key]["total"] += 1
+                        if t.result == "win":
+                            monthly_win_data[m_key]["wins"] += 1
+
+                    monthly_table = []
+                    cum = 0
+                    for m in months:
+                        val = result.monthly_pnl[m]
+                        cum += val
+                        mw = monthly_win_data.get(m, {"wins": 0, "total": 0})
+                        wr = (mw["wins"] / mw["total"] * 100) if mw["total"] else 0
+                        monthly_table.append({
+                            "Month": m,
+                            "Trades": mw["total"],
+                            "Win Rate": f"{wr:.0f}%",
+                            "Net Pips": f"{val:+.1f}",
+                            "Cumulative": f"{cum:+.1f}",
+                        })
+                    st.dataframe(pd.DataFrame(monthly_table),
+                                 use_container_width=True, hide_index=True)
+
+                # ── Day + Hour ──
                 col_day, col_hour = st.columns(2)
                 with col_day:
                     section("P&L by Day of Week")
@@ -653,12 +793,23 @@ if run_btn or optimize_btn:
                         day_order = ["Mon", "Tue", "Wed", "Thu", "Fri"]
                         days = [d for d in day_order if d in result.daily_pnl]
                         day_vals = [result.daily_pnl[d] for d in days]
+
+                        # Also count trades per day
+                        day_trades = {}
+                        day_wins = {}
+                        for t in result.trades:
+                            d_key = t.entry_datetime.strftime("%a")[:3]
+                            day_trades[d_key] = day_trades.get(d_key, 0) + 1
+                            if t.result == "win":
+                                day_wins[d_key] = day_wins.get(d_key, 0) + 1
+
                         d_fig = go.Figure(go.Bar(
                             x=days, y=day_vals,
                             marker_color=[GREEN if v >= 0 else RED for v in day_vals],
-                            text=[f"{v:+.0f}" for v in day_vals], textposition="outside",
+                            text=[f"{v:+.0f}p ({day_trades.get(d, 0)}t)" for d, v in zip(days, day_vals)],
+                            textposition="outside",
                         ))
-                        d_fig.update_layout(**CHART_LAYOUT, height=280, yaxis_title="Pips")
+                        d_fig.update_layout(**CHART_LAYOUT, height=300, yaxis_title="Pips")
                         st.plotly_chart(d_fig, use_container_width=True)
 
                 with col_hour:
@@ -666,14 +817,37 @@ if run_btn or optimize_btn:
                     if result.hourly_pnl:
                         hours = sorted(result.hourly_pnl.keys())
                         hour_vals = [result.hourly_pnl[h] for h in hours]
+                        # Color-code by session zones
+                        hour_colors = []
+                        for h in hours:
+                            v = result.hourly_pnl[h]
+                            if v >= 0:
+                                hour_colors.append(GREEN)
+                            else:
+                                hour_colors.append(RED)
+
                         h_fig = go.Figure(go.Bar(
                             x=[f"{h:02d}" for h in hours], y=hour_vals,
-                            marker_color=[GREEN if v >= 0 else RED for v in hour_vals],
+                            marker_color=hour_colors,
+                            text=[f"{v:+.0f}" for v in hour_vals],
+                            textposition="outside", textfont=dict(size=9),
                         ))
-                        h_fig.update_layout(**CHART_LAYOUT, height=280, yaxis_title="Pips")
+                        # Session zone shading
+                        h_fig.add_vrect(x0=-0.5, x1=7.5, fillcolor="rgba(88,166,255,0.04)",
+                                        line_width=0, annotation_text="Asia",
+                                        annotation_position="top left",
+                                        annotation_font_color="#484f58")
+                        london_start = [f"{h:02d}" for h in hours].index("08") if "08" in [f"{h:02d}" for h in hours] else None
+                        if london_start is not None:
+                            h_fig.add_vrect(x0=london_start - 0.5, x1=london_start + 8.5,
+                                            fillcolor="rgba(63,185,80,0.04)", line_width=0,
+                                            annotation_text="London",
+                                            annotation_position="top left",
+                                            annotation_font_color="#484f58")
+                        h_fig.update_layout(**CHART_LAYOUT, height=300, yaxis_title="Pips")
                         st.plotly_chart(h_fig, use_container_width=True)
 
-                # Breakdown tables
+                # ── Breakdown tables (Session + Signal + Confluence) ──
                 col_sess, col_sig = st.columns(2)
                 with col_sess:
                     section("Session Breakdown")
@@ -681,14 +855,28 @@ if run_btn or optimize_btn:
                         sess_data = []
                         for s, stats in result.session_breakdown.items():
                             wr = (stats["wins"] / stats["trades"] * 100) if stats["trades"] else 0
+                            avg = (stats["pips"] / stats["trades"]) if stats["trades"] else 0
                             sess_data.append({
                                 "Session": s.replace("_", " ").title(),
                                 "Trades": stats["trades"], "Wins": stats["wins"],
                                 "Win Rate": f"{wr:.0f}%",
                                 "Net Pips": f"{stats['pips']:+.1f}",
+                                "Avg/Trade": f"{avg:+.1f}",
                             })
                         st.dataframe(pd.DataFrame(sess_data),
                                      use_container_width=True, hide_index=True)
+
+                        # Session donut
+                        s_labels = [d["Session"] for d in sess_data]
+                        s_vals = [d["Trades"] for d in sess_data]
+                        s_fig = go.Figure(go.Pie(
+                            values=s_vals, labels=s_labels,
+                            marker=dict(colors=[BLUE, GREEN, GOLD, CYAN, RED][:len(s_labels)]),
+                            hole=0.55, textinfo="label+percent",
+                            textfont=dict(size=10),
+                        ))
+                        s_fig.update_layout(**CHART_LAYOUT, height=250, showlegend=False)
+                        st.plotly_chart(s_fig, use_container_width=True)
 
                 with col_sig:
                     section("Signal Type Breakdown")
@@ -696,16 +884,31 @@ if run_btn or optimize_btn:
                         sig_data = []
                         for st_name, stats in result.signal_type_breakdown.items():
                             wr = (stats["wins"] / stats["trades"] * 100) if stats["trades"] else 0
+                            avg = (stats["pips"] / stats["trades"]) if stats["trades"] else 0
                             sig_data.append({
                                 "Type": st_name.replace("_", " ").title(),
                                 "Trades": stats["trades"], "Wins": stats["wins"],
                                 "Win Rate": f"{wr:.0f}%",
                                 "Net Pips": f"{stats['pips']:+.1f}",
+                                "Avg/Trade": f"{avg:+.1f}",
                             })
                         st.dataframe(pd.DataFrame(sig_data),
                                      use_container_width=True, hide_index=True)
 
-                # Confluence analysis
+                        # Signal type comparison bar
+                        sig_names = [d["Type"] for d in sig_data]
+                        sig_pips = [float(d["Net Pips"]) for d in sig_data]
+                        sig_fig = go.Figure(go.Bar(
+                            x=sig_names, y=sig_pips,
+                            marker_color=[GREEN if v >= 0 else RED for v in sig_pips],
+                            text=[f"{v:+.0f}p" for v in sig_pips],
+                            textposition="outside",
+                        ))
+                        sig_fig.update_layout(**CHART_LAYOUT, height=250,
+                                              yaxis_title="Net Pips")
+                        st.plotly_chart(sig_fig, use_container_width=True)
+
+                # ── Confluence analysis ──
                 section("Confluence Score Analysis")
                 if result.confluence_breakdown:
                     conf_scores = sorted(result.confluence_breakdown.keys())
@@ -715,12 +918,17 @@ if run_btn or optimize_btn:
                                 result.confluence_breakdown[s]["trades"] * 100)
                                if result.confluence_breakdown[s]["trades"] else 0
                                for s in conf_scores]
+                    conf_avg = [(result.confluence_breakdown[s]["pips"] /
+                                 result.confluence_breakdown[s]["trades"])
+                                if result.confluence_breakdown[s]["trades"] else 0
+                                for s in conf_scores]
 
                     conf_fig = make_subplots(specs=[[{"secondary_y": True}]])
                     conf_fig.add_trace(go.Bar(
-                        x=[f"{s}" for s in conf_scores], y=conf_pips,
-                        name="Net Pips",
-                        marker_color=[GREEN if v >= 0 else RED for v in conf_pips],
+                        x=[f"{s}" for s in conf_scores], y=conf_avg,
+                        name="Avg Pips/Trade",
+                        marker_color=[GREEN if v >= 0 else RED for v in conf_avg],
+                        text=[f"{v:+.1f}" for v in conf_avg], textposition="outside",
                     ), secondary_y=False)
                     conf_fig.add_trace(go.Scatter(
                         x=[f"{s}" for s in conf_scores], y=conf_wr,
@@ -728,56 +936,122 @@ if run_btn or optimize_btn:
                         line=dict(color=GOLD, width=2),
                         marker=dict(size=8),
                     ), secondary_y=True)
+                    # Add trade count labels
+                    conf_fig.add_trace(go.Scatter(
+                        x=[f"{s}" for s in conf_scores],
+                        y=[max(conf_avg) * 1.3] * len(conf_scores),
+                        text=[f"{n}t" for n in conf_trades],
+                        mode="text", textfont=dict(color="#8b949e", size=10),
+                        name="Count", showlegend=False,
+                    ), secondary_y=False)
                     conf_fig.update_layout(**CHART_LAYOUT, height=320,
                                            xaxis_title="Confluence Score",
                                            legend=dict(orientation="h", yanchor="bottom",
                                                        y=1.02, bgcolor="rgba(0,0,0,0)"))
-                    conf_fig.update_yaxes(title_text="Net Pips", secondary_y=False,
+                    conf_fig.update_yaxes(title_text="Avg Pips/Trade", secondary_y=False,
                                            gridcolor="rgba(48,54,61,0.5)")
                     conf_fig.update_yaxes(title_text="Win Rate %", secondary_y=True,
-                                           showgrid=False)
+                                           showgrid=False, range=[0, 100])
                     st.plotly_chart(conf_fig, use_container_width=True)
 
-                # PnL distribution + Holding time
+                # ── PnL distribution + Holding time ──
                 col_dist, col_hold = st.columns(2)
                 with col_dist:
                     section("PnL Distribution")
-                    pnls = [t.pnl_pips for t in result.trades]
                     dist_fig = go.Figure()
-                    dist_fig.add_trace(go.Histogram(
-                        x=pnls, nbinsx=25,
-                        marker_color=BLUE, opacity=0.7,
-                    ))
+                    # Separate win/loss histograms
+                    if win_pnls:
+                        dist_fig.add_trace(go.Histogram(
+                            x=win_pnls, name="Wins", nbinsx=15,
+                            marker_color=GREEN, opacity=0.6,
+                        ))
+                    if loss_pnls:
+                        dist_fig.add_trace(go.Histogram(
+                            x=loss_pnls, name="Losses", nbinsx=15,
+                            marker_color=RED, opacity=0.6,
+                        ))
                     dist_fig.add_vline(x=0, line_dash="dash", line_color="#484f58", line_width=2)
-                    avg_pnl = np.mean(pnls)
                     dist_fig.add_vline(x=avg_pnl, line_dash="dot", line_color=GOLD,
                                         annotation_text=f"Avg: {avg_pnl:+.1f}",
                                         annotation_font_color=GOLD)
-                    dist_fig.update_layout(**CHART_LAYOUT, height=300,
-                                            xaxis_title="Pips", yaxis_title="Count")
+                    dist_fig.add_vline(x=median_pnl, line_dash="dot", line_color=CYAN,
+                                        annotation_text=f"Med: {median_pnl:+.1f}",
+                                        annotation_font_color=CYAN,
+                                        annotation_position="bottom right")
+                    dist_fig.update_layout(**CHART_LAYOUT, height=300, barmode="overlay",
+                                            xaxis_title="Pips", yaxis_title="Count",
+                                            legend=dict(orientation="h", yanchor="bottom",
+                                                        y=1.02, bgcolor="rgba(0,0,0,0)"))
                     st.plotly_chart(dist_fig, use_container_width=True)
 
                 with col_hold:
                     section("Holding Time Distribution")
                     hold_times = [t.holding_candles for t in result.trades]
+                    win_hold = [t.holding_candles for t in wins_list]
+                    loss_hold = [t.holding_candles for t in losses_list]
                     hold_fig = go.Figure()
-                    hold_fig.add_trace(go.Histogram(
-                        x=hold_times, nbinsx=20,
-                        marker_color=CYAN, opacity=0.7,
-                    ))
-                    avg_hold = np.mean(hold_times)
+                    if win_hold:
+                        hold_fig.add_trace(go.Histogram(
+                            x=win_hold, name="Wins", nbinsx=15,
+                            marker_color=GREEN, opacity=0.6,
+                        ))
+                    if loss_hold:
+                        hold_fig.add_trace(go.Histogram(
+                            x=loss_hold, name="Losses", nbinsx=15,
+                            marker_color=RED, opacity=0.6,
+                        ))
                     hold_fig.add_vline(x=avg_hold, line_dash="dot", line_color=GOLD,
                                        annotation_text=f"Avg: {avg_hold:.0f}",
                                        annotation_font_color=GOLD)
-                    hold_fig.update_layout(**CHART_LAYOUT, height=300,
-                                            xaxis_title="Candles Held", yaxis_title="Count")
+                    hold_fig.update_layout(**CHART_LAYOUT, height=300, barmode="overlay",
+                                            xaxis_title="Candles Held", yaxis_title="Count",
+                                            legend=dict(orientation="h", yanchor="bottom",
+                                                        y=1.02, bgcolor="rgba(0,0,0,0)"))
                     st.plotly_chart(hold_fig, use_container_width=True)
 
-                # MFE/MAE
+                # ── R-Multiple Analysis ──
+                section("R-Multiple Analysis")
+                if result.trades and result.trades[0].stop_loss != 0:
+                    r_multiples = []
+                    for t in result.trades:
+                        risk_pips_val = abs(t.entry_price - t.stop_loss) / get_pip_size(pair)
+                        if risk_pips_val > 0:
+                            r_multiples.append(t.pnl_pips / risk_pips_val)
+                        else:
+                            r_multiples.append(0)
+
+                    r_col1, r_col2 = st.columns(2)
+                    with r_col1:
+                        r_fig = go.Figure(go.Histogram(
+                            x=r_multiples, nbinsx=20,
+                            marker_color=BLUE, opacity=0.7,
+                        ))
+                        avg_r = np.mean(r_multiples)
+                        r_fig.add_vline(x=0, line_dash="dash", line_color="#484f58")
+                        r_fig.add_vline(x=avg_r, line_dash="dot", line_color=GOLD,
+                                         annotation_text=f"Avg: {avg_r:+.2f}R",
+                                         annotation_font_color=GOLD)
+                        r_fig.update_layout(**CHART_LAYOUT, height=280,
+                                             xaxis_title="R-Multiple", yaxis_title="Count",
+                                             title="R-Multiple Distribution")
+                        st.plotly_chart(r_fig, use_container_width=True)
+
+                    with r_col2:
+                        # R-multiple over time
+                        r_time_fig = go.Figure(go.Bar(
+                            y=r_multiples,
+                            marker_color=[GREEN if r >= 0 else RED for r in r_multiples],
+                        ))
+                        r_time_fig.add_hline(y=0, line_color="#484f58", line_width=1)
+                        r_time_fig.update_layout(**CHART_LAYOUT, height=280,
+                                                  xaxis_title="Trade #",
+                                                  yaxis_title="R-Multiple",
+                                                  title="R-Multiple by Trade")
+                        st.plotly_chart(r_time_fig, use_container_width=True)
+
+                # ── MFE/MAE ──
                 section("MFE / MAE Scatter (Trade Efficiency)")
                 mfe_col, mae_col = st.columns(2)
-                wins_list = [t for t in result.trades if t.result == "win"]
-                losses_list = [t for t in result.trades if t.result == "loss"]
 
                 with mfe_col:
                     mfe_fig = go.Figure()
@@ -795,8 +1069,16 @@ if run_btn or optimize_btn:
                             mode="markers", name="Losses",
                             marker=dict(color=RED, size=7, opacity=0.8),
                         ))
+                    # Capture ratio line
+                    all_mfe = [t.max_favorable_pips for t in result.trades]
+                    if all_mfe and max(all_mfe) > 0:
+                        mfe_fig.add_trace(go.Scatter(
+                            x=[0, max(all_mfe)], y=[0, max(all_mfe)],
+                            mode="lines", line=dict(color="#484f58", dash="dot", width=1),
+                            name="100% capture", showlegend=True,
+                        ))
                     mfe_fig.update_layout(**CHART_LAYOUT, height=300,
-                                           xaxis_title="Max Favorable Excursion (pips)",
+                                           xaxis_title="Max Favorable (pips)",
                                            yaxis_title="PnL (pips)", title="MFE vs PnL")
                     st.plotly_chart(mfe_fig, use_container_width=True)
 
@@ -817,11 +1099,27 @@ if run_btn or optimize_btn:
                             marker=dict(color=RED, size=7, opacity=0.8),
                         ))
                     mae_fig.update_layout(**CHART_LAYOUT, height=300,
-                                           xaxis_title="Max Adverse Excursion (pips)",
+                                           xaxis_title="Max Adverse (pips)",
                                            yaxis_title="PnL (pips)", title="MAE vs PnL")
                     st.plotly_chart(mae_fig, use_container_width=True)
 
-                # Streak visualization
+                # MFE/MAE efficiency stats
+                if wins_list:
+                    avg_win_mfe = np.mean([t.max_favorable_pips for t in wins_list])
+                    avg_win_pnl_val = np.mean([t.pnl_pips for t in wins_list])
+                    capture_ratio = (avg_win_pnl_val / avg_win_mfe * 100) if avg_win_mfe > 0 else 0
+                    avg_loss_mae = np.mean([t.max_adverse_pips for t in losses_list]) if losses_list else 0
+                    avg_win_mae = np.mean([t.max_adverse_pips for t in wins_list])
+
+                    ef1, ef2, ef3, ef4 = st.columns(4)
+                    ef1.metric("Avg Win MFE", f"{avg_win_mfe:.1f}p")
+                    ef2.metric("Win Capture Rate", f"{capture_ratio:.0f}%",
+                               help="How much of the max favorable move wins actually capture")
+                    ef3.metric("Avg Win MAE", f"{avg_win_mae:.1f}p",
+                               help="How much pain winning trades endure")
+                    ef4.metric("Avg Loss MAE", f"{avg_loss_mae:.1f}p")
+
+                # ── Win/Loss Streaks ──
                 section("Win/Loss Streaks")
                 streak_colors = []
                 streak_vals = []
