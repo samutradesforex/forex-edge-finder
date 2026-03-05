@@ -315,7 +315,9 @@ def edge_badge(result) -> str:
 
 
 def fmt_pf(val):
-    return f"{val:.2f}" if val != float("inf") else "---"
+    if val != val or val == float("inf") or val == float("-inf"):
+        return "---"
+    return f"{val:.2f}"
 
 
 def color_pips(val):
@@ -360,7 +362,7 @@ with st.sidebar:
         interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d"}
         yf_interval = interval_map[interval]
         # yfinance period limits for intraday data
-        period_limits = {"1m": "7d", "5m": "60d"}
+        period_limits = {"1m": "7d", "5m": "60d", "15m": "60d"}
         if interval in period_limits:
             max_period = period_limits[interval]
             period = max_period
@@ -550,6 +552,10 @@ if run_btn or optimize_btn:
             st.error(f"Failed to load data: {e}")
             st.stop()
 
+    if df is None or df.empty:
+        st.error("No data returned. Check pair/period/interval and try again.")
+        st.stop()
+
     st.toast(f"Loaded {len(df)} candles for {pair} ({interval})")
 
     if run_btn:
@@ -632,8 +638,8 @@ if run_btn or optimize_btn:
                 # ── Risk metrics ──
                 section("Risk Metrics")
                 r1, r2, r3, r4, r5, r6 = st.columns(6)
-                r1.metric("Sharpe", f"{result.sharpe_ratio:.2f}")
-                r2.metric("Sortino", f"{result.sortino_ratio:.2f}")
+                r1.metric("Sharpe", fmt_pf(result.sharpe_ratio))
+                r2.metric("Sortino", fmt_pf(result.sortino_ratio))
                 r3.metric("Recovery", fmt_pf(result.recovery_factor))
                 r4.metric("Payoff", fmt_pf(result.payoff_ratio))
                 r5.metric("Win Streak", result.max_consecutive_wins)
@@ -735,10 +741,10 @@ if run_btn or optimize_btn:
                 # ── Account summary + Export ──
                 section("Account Summary")
                 a1, a2, a3, a4 = st.columns(4)
-                ret_color = "normal" if acct_sim.total_return_pct >= 0 else "inverse"
                 a1.metric("Starting", f"${acct_sim.starting_balance:,.0f}")
                 a2.metric("Ending", f"${acct_sim.ending_balance:,.0f}",
-                           delta=f"{acct_sim.total_return_pct:+.1f}%")
+                           delta=f"{acct_sim.total_return_pct:+.1f}%",
+                           delta_color="normal" if acct_sim.total_return_pct >= 0 else "inverse")
                 a3.metric("Max DD", f"{acct_sim.max_drawdown_pct:.1f}%")
                 a4.metric("Avg Confluence", f"{result.avg_confluence_score:.1f}/8")
 
@@ -1596,6 +1602,12 @@ if run_btn or optimize_btn:
             else:
                 st.info("No trades generated with current settings.")
 
+    # Show guidance on other tabs when only optimizing
+    if optimize_btn and not run_btn:
+        for _tab in [tab_results, tab_analysis, tab_account, tab_chart, tab_trades]:
+            with _tab:
+                st.info("Click **RUN BACKTEST** to populate this tab. Optimization results are in the **Optimizer** tab.")
+
     # ═══════════════════════════════════════════════════════════════════
     # TAB 6: OPTIMIZER
     # ═══════════════════════════════════════════════════════════════════
@@ -1739,8 +1751,7 @@ with tab_discovery:
     disc_col1, disc_col2 = st.columns([3, 1])
 
     with disc_col2:
-        disc_period = st.selectbox("Discovery period", ["3mo", "6mo", "1y"], index=1,
-                                    key="disc_period")
+        st.caption("Uses max available history per interval (1h=2y, 1d=22y)")
         disc_min_trades = st.number_input("Min trades", value=10, min_value=3, key="disc_min_tr")
         disc_min_pf = st.number_input("Min profit factor", value=1.2, step=0.1, key="disc_min_pf")
 
@@ -1771,7 +1782,7 @@ with tab_discovery:
                 "min_profit_factor": disc_min_pf,
             }
             if start_discovery_background(
-                period=disc_period, thresholds=_disc_thresholds,
+                thresholds=_disc_thresholds,
             ):
                 st.toast("Discovery started! This runs in the background.")
                 st.rerun()
@@ -1786,37 +1797,40 @@ with tab_discovery:
             st.toast("Results cleared.")
             st.rerun()
 
-        # Progress display
-        if _disc_running or _disc_state.status == "waiting":
-            if _disc_state.status != "waiting":
-                st.progress(_disc_state.progress_pct / 100,
-                            text=f"{_disc_state.progress_pct:.1f}% — {_disc_state.current_pair} "
-                                 f"{_disc_state.current_interval} {_disc_state.current_strategy} "
-                                 f"| {_disc_state.edges_found} edges found")
+        # Progress display (auto-refreshes every 5s while discovery is running)
+        @st.fragment(run_every=5 if (_disc_running or _disc_state.status == "waiting") else None)
+        def _discovery_progress():
+            state = get_discovery_state()
+            running = is_discovery_running()
+            if running or state.status == "waiting":
+                if state.status == "waiting":
+                    st.info(
+                        f"Sweep complete — {state.edges_found} edges found. "
+                        f"Next sweep starts automatically in ~5 min. Running continuously."
+                    )
+                else:
+                    st.progress(state.progress_pct / 100,
+                                text=f"{state.progress_pct:.1f}% — {state.current_pair} "
+                                     f"{state.current_interval} {state.current_strategy} "
+                                     f"| {state.edges_found} edges found")
 
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("Combos Tested", f"{_disc_state.combos_tested:,}")
-            p2.metric("Total Combos", f"{_disc_state.total_combos:,}")
-            p3.metric("Edges Found", _disc_state.edges_found)
-            _validated = getattr(_disc_state, 'edges_validated', 0)
-            p4.metric("Validated", f"{_validated} / {_disc_state.edges_found}")
+                p1, p2, p3, p4 = st.columns(4)
+                p1.metric("Combos Tested", f"{state.combos_tested:,}")
+                p2.metric("Total Combos", f"{state.total_combos:,}")
+                p3.metric("Edges Found", state.edges_found)
+                _validated = getattr(state, 'edges_validated', 0)
+                p4.metric("Validated", f"{_validated} / {state.edges_found}")
 
-            if st.button("Refresh", key="disc_refresh"):
-                st.rerun()
+            elif state.status == "completed":
+                st.success(
+                    f"Discovery complete — {state.combos_tested:,} combos tested, "
+                    f"{state.edges_found} edges found in "
+                    f"{state.elapsed_seconds/60:.1f} min"
+                )
+            elif state.status == "paused":
+                st.warning("Discovery paused. Click Start to resume.")
 
-        elif _disc_state.status == "waiting":
-            st.info(
-                f"Sweep complete — {_disc_state.edges_found} edges found. "
-                f"Next sweep starts automatically in ~5 min. Running continuously."
-            )
-        elif _disc_state.status == "completed":
-            st.success(
-                f"Discovery complete — {_disc_state.combos_tested:,} combos tested, "
-                f"{_disc_state.edges_found} edges found in "
-                f"{_disc_state.elapsed_seconds/60:.1f} min"
-            )
-        elif _disc_state.status == "paused":
-            st.warning("Discovery paused. Click Start to resume.")
+        _discovery_progress()
 
     # Display discovered edges
     _disc_edges = load_edges()
