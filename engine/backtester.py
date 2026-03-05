@@ -11,6 +11,7 @@ Features:
 
 import pandas as pd
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from itertools import product
@@ -475,17 +476,26 @@ def run_backtest(
     max_consecutive_losses: int = 0,
     use_multi_tf_swings: bool = False,
     interval: str = "",
+    _precomputed: dict = None,
 ) -> BacktestResult:
     """Run a full backtest with all advanced features."""
     pip_size = get_pip_size(pair_name)
 
-    # Pre-compute indicators once
-    atr = calc_atr(df)
-    rsi = calc_rsi(df)
-    ema_fast = calc_ema(df["Close"], 21)
-    ema_slow = calc_ema(df["Close"], 50)
-    fvgs = find_fvgs(df, pip_size=pip_size)
-    obs = find_order_blocks(df, pip_size=pip_size)
+    # Use pre-computed indicators when available (optimizer passes these)
+    if _precomputed:
+        atr = _precomputed["atr"]
+        rsi = _precomputed["rsi"]
+        ema_fast = _precomputed["ema_fast"]
+        ema_slow = _precomputed["ema_slow"]
+        fvgs = _precomputed["fvgs"]
+        obs = _precomputed["obs"]
+    else:
+        atr = calc_atr(df)
+        rsi = calc_rsi(df)
+        ema_fast = calc_ema(df["Close"], 21)
+        ema_slow = calc_ema(df["Close"], 50)
+        fvgs = find_fvgs(df, pip_size=pip_size)
+        obs = find_order_blocks(df, pip_size=pip_size)
 
     # Detect structure
     if use_multi_tf_swings:
@@ -651,22 +661,31 @@ def optimize_parameters(
             return 0.0
         return min(v, cap)
 
-    results = []
-    for combo in combinations:
-        params = dict(zip(param_names, combo))
+    # Pre-compute indicators once — these don't change across param combos
+    pip_size = get_pip_size(pair_name)
+    precomputed = {
+        "atr": calc_atr(df),
+        "rsi": calc_rsi(df),
+        "ema_fast": calc_ema(df["Close"], 21),
+        "ema_slow": calc_ema(df["Close"], 50),
+        "fvgs": find_fvgs(df, pip_size=pip_size),
+        "obs": find_order_blocks(df, pip_size=pip_size),
+    }
 
+    def _eval_combo(combo):
+        """Evaluate a single parameter combination."""
+        params = dict(zip(param_names, combo))
         try:
             bt_result = run_backtest(df, pair_name, strategy=strategy,
-                                        interval=interval, **params)
+                                    interval=interval,
+                                    _precomputed=precomputed, **params)
 
             if bt_result.total_trades < 5:
-                continue
+                return None
 
             pf = _safe_val(bt_result.profit_factor, 10.0)
             rf = _safe_val(bt_result.recovery_factor, 20.0)
-            pr = _safe_val(bt_result.payoff_ratio, 10.0)
 
-            # Compute optimization score
             if optimize_for == "expectancy":
                 score = bt_result.expectancy_pips
             elif optimize_for == "profit_factor":
@@ -678,12 +697,11 @@ def optimize_parameters(
             elif optimize_for == "win_rate":
                 score = bt_result.win_rate
             elif optimize_for == "combined":
-                # Normalized balanced score (all components on 0-100 scale)
-                norm_exp = min(max(bt_result.expectancy_pips, -10), 10) * 5  # -50 to 50
-                norm_pf = min(pf, 5) * 10  # 0 to 50
-                norm_sharpe = min(max(bt_result.sharpe_ratio, -2), 5) * 10  # -20 to 50
-                norm_wr = bt_result.win_rate  # 0 to 100
-                norm_rf = min(rf, 10) * 5  # 0 to 50
+                norm_exp = min(max(bt_result.expectancy_pips, -10), 10) * 5
+                norm_pf = min(pf, 5) * 10
+                norm_sharpe = min(max(bt_result.sharpe_ratio, -2), 5) * 10
+                norm_wr = bt_result.win_rate
+                norm_rf = min(rf, 10) * 5
                 score = (
                     norm_exp * 0.25 +
                     norm_pf * 0.25 +
@@ -694,11 +712,10 @@ def optimize_parameters(
             else:
                 score = bt_result.expectancy_pips
 
-            # Guard against NaN score
             if score != score:  # NaN check
-                continue
+                return None
 
-            results.append(OptimizationResult(
+            return OptimizationResult(
                 params=params,
                 total_pips=bt_result.total_pips,
                 win_rate=bt_result.win_rate,
@@ -708,9 +725,15 @@ def optimize_parameters(
                 sharpe_ratio=bt_result.sharpe_ratio,
                 expectancy=bt_result.expectancy_pips,
                 score=round(score, 2),
-            ))
+            )
         except (ValueError, KeyError, IndexError):
-            continue
+            return None
+
+    results = []
+    for combo in combinations:
+        result = _eval_combo(combo)
+        if result is not None:
+            results.append(result)
 
     # Sort by score descending
     results.sort(key=lambda r: r.score, reverse=True)

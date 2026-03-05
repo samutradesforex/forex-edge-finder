@@ -550,7 +550,10 @@ if run_btn or optimize_btn:
             _, structure_breaks, _ = compute_structure(df, swing_lookback=swing_lookback)
 
         with st.spinner("Running backtest..."):
-            result = run_backtest(df, pair, **get_backtest_kwargs())
+            bt_kwargs = get_backtest_kwargs()
+            result = run_backtest(df, pair, **bt_kwargs)
+            st.session_state["last_result"] = result
+            st.session_state["last_bt_kwargs"] = bt_kwargs
 
         # Apply structure bias filter
         if use_structure_filter and structure_breaks:

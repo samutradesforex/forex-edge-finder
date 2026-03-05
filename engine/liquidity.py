@@ -10,6 +10,8 @@ Identifies liquidity inducement patterns:
 - Order block detection
 """
 
+import bisect
+
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
@@ -118,27 +120,30 @@ def is_in_killzone(dt: pd.Timestamp) -> bool:
 # ── Swing detection ─────────────────────────────────────────────────────────
 
 def find_swing_points(df: pd.DataFrame, lookback: int = 5) -> List[SwingPoint]:
-    """Detect swing highs and swing lows using rolling window approach."""
+    """Detect swing highs and swing lows using vectorized rolling max/min."""
     highs = df["High"].values
     lows = df["Low"].values
     dates = df.index
     swings = []
     n = len(df)
 
-    # Pre-compute rolling max/min using numpy stride tricks for speed
     win = 2 * lookback + 1
     if n < win:
         return swings
 
+    # Vectorized: compute rolling max/min once instead of per-candle slicing
+    h_series = pd.Series(highs)
+    l_series = pd.Series(lows)
+    roll_max = h_series.rolling(win, center=True).max().values
+    roll_min = l_series.rolling(win, center=True).min().values
+
     for i in range(lookback, n - lookback):
         h_val = highs[i]
-        window_h = highs[i - lookback : i + lookback + 1]
-        if h_val >= window_h.max() and np.count_nonzero(window_h == h_val) == 1:
+        if h_val >= roll_max[i] and np.count_nonzero(highs[i - lookback : i + lookback + 1] == h_val) == 1:
             swings.append(SwingPoint(index=i, datetime=dates[i], price=h_val, kind="high"))
 
         l_val = lows[i]
-        window_l = lows[i - lookback : i + lookback + 1]
-        if l_val <= window_l.min() and np.count_nonzero(window_l == l_val) == 1:
+        if l_val <= roll_min[i] and np.count_nonzero(lows[i - lookback : i + lookback + 1] == l_val) == 1:
             swings.append(SwingPoint(index=i, datetime=dates[i], price=l_val, kind="low"))
 
     return swings
@@ -201,23 +206,26 @@ def find_fvgs(df: pd.DataFrame, min_gap_pips: float = 2.0,
     """Detect Fair Value Gaps (3-candle imbalances)."""
     fvgs = []
     min_gap = min_gap_pips * pip_size
+    low_arr = df["Low"].values
+    high_arr = df["High"].values
+    dates = df.index
 
-    for i in range(2, len(df)):
-        # Bullish FVG: candle[i] low > candle[i-2] high
-        gap = df["Low"].iloc[i] - df["High"].iloc[i - 2]
-        if gap > min_gap:
+    # Vectorized gap detection
+    bull_gaps = low_arr[2:] - high_arr[:-2]
+    bear_gaps = low_arr[:-2] - high_arr[2:]
+
+    for i in range(len(bull_gaps)):
+        idx = i + 2
+        if bull_gaps[i] > min_gap:
             fvgs.append(FairValueGap(
-                index=i - 1, datetime=df.index[i - 1],
-                top=df["Low"].iloc[i], bottom=df["High"].iloc[i - 2],
+                index=idx - 1, datetime=dates[idx - 1],
+                top=low_arr[idx], bottom=high_arr[idx - 2],
                 direction="bullish",
             ))
-
-        # Bearish FVG: candle[i-2] low > candle[i] high
-        gap = df["Low"].iloc[i - 2] - df["High"].iloc[i]
-        if gap > min_gap:
+        if bear_gaps[i] > min_gap:
             fvgs.append(FairValueGap(
-                index=i - 1, datetime=df.index[i - 1],
-                top=df["Low"].iloc[i - 2], bottom=df["High"].iloc[i],
+                index=idx - 1, datetime=dates[idx - 1],
+                top=low_arr[idx - 2], bottom=high_arr[idx],
                 direction="bearish",
             ))
 
@@ -231,27 +239,37 @@ def find_order_blocks(df: pd.DataFrame, displacement_pips: float = 15.0,
     """Detect order blocks (last opposing candle before strong displacement)."""
     obs = []
     min_disp = displacement_pips * pip_size
+    close_arr = df["Close"].values
+    open_arr = df["Open"].values
+    high_arr = df["High"].values
+    low_arr = df["Low"].values
+    dates = df.index
 
-    for i in range(2, len(df)):
-        body_i = df["Close"].iloc[i] - df["Open"].iloc[i]
-        body_prev = df["Close"].iloc[i - 1] - df["Open"].iloc[i - 1]
+    # Vectorized body calculations
+    body = close_arr - open_arr
+    body_curr = body[2:]
+    body_prev = body[1:-1]
 
-        # Bullish OB: bearish candle followed by strong bullish displacement
-        if body_prev < 0 and body_i > min_disp:
-            obs.append(OrderBlock(
-                index=i - 1, datetime=df.index[i - 1],
-                high=df["High"].iloc[i - 1], low=df["Low"].iloc[i - 1],
-                direction="bullish",
-            ))
+    bull_mask = (body_prev < 0) & (body_curr > min_disp)
+    bear_mask = (body_prev > 0) & (body_curr < -min_disp)
 
-        # Bearish OB: bullish candle followed by strong bearish displacement
-        if body_prev > 0 and body_i < -min_disp:
-            obs.append(OrderBlock(
-                index=i - 1, datetime=df.index[i - 1],
-                high=df["High"].iloc[i - 1], low=df["Low"].iloc[i - 1],
-                direction="bearish",
-            ))
+    for i in np.where(bull_mask)[0]:
+        idx = i + 1  # original df index of the OB candle
+        obs.append(OrderBlock(
+            index=idx, datetime=dates[idx],
+            high=high_arr[idx], low=low_arr[idx],
+            direction="bullish",
+        ))
+    for i in np.where(bear_mask)[0]:
+        idx = i + 1
+        obs.append(OrderBlock(
+            index=idx, datetime=dates[idx],
+            high=high_arr[idx], low=low_arr[idx],
+            direction="bearish",
+        ))
 
+    # Sort by index to maintain order
+    obs.sort(key=lambda o: o.index)
     return obs
 
 
@@ -315,14 +333,37 @@ def is_engulfing(df: pd.DataFrame, index: int, direction: str) -> bool:
 
 # ── Confluence scoring ──────────────────────────────────────────────────────
 
+def _build_fvg_index(fvgs: List[FairValueGap]) -> List[int]:
+    """Build sorted index list for bisect lookups on FVGs."""
+    return [fvg.index for fvg in fvgs]
+
+
+def _build_ob_index(obs: List[OrderBlock]) -> List[int]:
+    """Build sorted index list for bisect lookups on order blocks."""
+    return [ob.index for ob in obs]
+
+
 def score_confluence(df: pd.DataFrame, index: int, direction: str,
                      level: LiquidityLevel, atr: pd.Series,
                      fvgs: List[FairValueGap], obs: List[OrderBlock],
                      rsi: pd.Series, ema_fast: pd.Series, ema_slow: pd.Series,
-                     pip_size: float) -> tuple:
+                     pip_size: float,
+                     _close_arr=None, _open_arr=None,
+                     _atr_arr=None, _rsi_arr=None,
+                     _ema_f_arr=None, _ema_s_arr=None,
+                     _fvg_indices=None, _ob_indices=None,
+                     ) -> tuple:
     """Score confluence factors for a signal. Returns (score, factors list)."""
     score = 0
     factors = []
+
+    # Use pre-extracted arrays when available
+    close_arr = _close_arr if _close_arr is not None else df["Close"].values
+    open_arr = _open_arr if _open_arr is not None else df["Open"].values
+    atr_arr = _atr_arr if _atr_arr is not None else atr.values
+    rsi_arr = _rsi_arr if _rsi_arr is not None else rsi.values
+    ema_f_arr = _ema_f_arr if _ema_f_arr is not None else ema_fast.values
+    ema_s_arr = _ema_s_arr if _ema_s_arr is not None else ema_slow.values
 
     # 1. Killzone timing
     dt = df.index[index]
@@ -331,22 +372,26 @@ def score_confluence(df: pd.DataFrame, index: int, direction: str,
         factors.append(f"killzone:{get_killzone(dt)}")
 
     # 2. Displacement confirmation
-    if has_displacement(df, index, direction, atr, multiplier=1.5):
-        score += 1
-        factors.append("displacement")
+    if index >= 1 and index < len(df):
+        body = abs(close_arr[index] - open_arr[index])
+        atr_val = atr_arr[index]
+        if not np.isnan(atr_val) and atr_val != 0 and body > (atr_val * 1.5):
+            score += 1
+            factors.append("displacement")
 
     # 3. Engulfing candle
     if is_engulfing(df, index, direction):
         score += 1
         factors.append("engulfing")
 
-    # 4. FVG confluence (nearby FVG in same direction, within 50 candles)
-    price = df["Close"].iloc[index]
-    for fvg in reversed(fvgs):  # check most recent first
-        if fvg.index >= index:
-            continue
-        if fvg.index < index - 50:
-            break  # too old, stop searching
+    # 4. FVG confluence — use bisect for O(log N) lookup
+    price = close_arr[index]
+    fvg_indices = _fvg_indices if _fvg_indices is not None else _build_fvg_index(fvgs)
+    search_start = index - 50
+    lo = bisect.bisect_left(fvg_indices, search_start)
+    hi = bisect.bisect_left(fvg_indices, index)
+    for k in range(hi - 1, lo - 1, -1):
+        fvg = fvgs[k]
         if direction == "long" and fvg.direction == "bullish":
             if fvg.bottom <= price <= fvg.top:
                 score += 1
@@ -358,12 +403,12 @@ def score_confluence(df: pd.DataFrame, index: int, direction: str,
                 factors.append("fvg_confluence")
                 break
 
-    # 5. Order block confluence (within 50 candles)
-    for ob in reversed(obs):  # check most recent first
-        if ob.index >= index:
-            continue
-        if ob.index < index - 50:
-            break  # too old, stop searching
+    # 5. Order block confluence — use bisect for O(log N) lookup
+    ob_indices = _ob_indices if _ob_indices is not None else _build_ob_index(obs)
+    lo = bisect.bisect_left(ob_indices, search_start)
+    hi = bisect.bisect_left(ob_indices, index)
+    for k in range(hi - 1, lo - 1, -1):
+        ob = obs[k]
         if direction == "long" and ob.direction == "bullish":
             if ob.low <= price <= ob.high:
                 score += 1
@@ -376,10 +421,10 @@ def score_confluence(df: pd.DataFrame, index: int, direction: str,
                 break
 
     # 6. EMA trend alignment
-    if index < len(ema_fast) and index < len(ema_slow):
-        ema_f = ema_fast.iloc[index]
-        ema_s = ema_slow.iloc[index]
-        if not pd.isna(ema_f) and not pd.isna(ema_s):
+    if index < len(ema_f_arr) and index < len(ema_s_arr):
+        ema_f = ema_f_arr[index]
+        ema_s = ema_s_arr[index]
+        if not np.isnan(ema_f) and not np.isnan(ema_s):
             if direction == "long" and ema_f > ema_s:
                 score += 1
                 factors.append("trend_aligned")
@@ -387,9 +432,9 @@ def score_confluence(df: pd.DataFrame, index: int, direction: str,
                 score += 1
                 factors.append("trend_aligned")
 
-    # 7. RSI confirmation (oversold for longs, overbought for shorts during sweep)
-    if index < len(rsi) and not pd.isna(rsi.iloc[index]):
-        rsi_val = rsi.iloc[index]
+    # 7. RSI confirmation
+    if index < len(rsi_arr) and not np.isnan(rsi_arr[index]):
+        rsi_val = rsi_arr[index]
         if direction == "long" and rsi_val < 35:
             score += 1
             factors.append(f"rsi_oversold:{rsi_val:.0f}")
@@ -434,14 +479,31 @@ def detect_liquidity_sweeps(df: pd.DataFrame, levels: List[LiquidityLevel],
     if ema_slow is None:
         ema_slow = calc_ema(df["Close"], 50)
 
+    # Pre-extract arrays for speed
+    high_arr = df["High"].values
+    low_arr = df["Low"].values
+    close_arr = df["Close"].values
+    open_arr = df["Open"].values
+    atr_arr = atr.values
+    rsi_arr = rsi.values
+    ema_f_arr = ema_fast.values
+    ema_s_arr = ema_slow.values
+    fvg_indices = _build_fvg_index(fvgs)
+    ob_indices = _build_ob_index(obs)
+    dates = df.index
+
+    conf_kw = dict(_close_arr=close_arr, _open_arr=open_arr,
+                   _atr_arr=atr_arr, _rsi_arr=rsi_arr,
+                   _ema_f_arr=ema_f_arr, _ema_s_arr=ema_s_arr,
+                   _fvg_indices=fvg_indices, _ob_indices=ob_indices)
+
     for level in levels:
         for i in range(1, len(df)):
-            high = df["High"].iloc[i]
-            low = df["Low"].iloc[i]
-            close = df["Close"].iloc[i]
-            dt = df.index[i]
+            high = high_arr[i]
+            low = low_arr[i]
+            close = close_arr[i]
+            dt = dates[i]
 
-            # Session filter
             if session_filter != "all":
                 session = get_session(dt)
                 if session != session_filter and session_filter != "killzones":
@@ -461,7 +523,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, levels: List[LiquidityLevel],
 
                     conf_score, conf_factors = score_confluence(
                         df, i, "short", level, atr, fvgs, obs, rsi,
-                        ema_fast, ema_slow, pip_size)
+                        ema_fast, ema_slow, pip_size, **conf_kw)
 
                     if conf_score < min_confluence:
                         continue
@@ -489,7 +551,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, levels: List[LiquidityLevel],
 
                     conf_score, conf_factors = score_confluence(
                         df, i, "long", level, atr, fvgs, obs, rsi,
-                        ema_fast, ema_slow, pip_size)
+                        ema_fast, ema_slow, pip_size, **conf_kw)
 
                     if conf_score < min_confluence:
                         continue
@@ -539,12 +601,30 @@ def detect_inducement_traps(df: pd.DataFrame, swings: List[SwingPoint],
 
     now = pd.Timestamp.now()
 
+    # Pre-extract arrays
+    high_arr = df["High"].values
+    low_arr = df["Low"].values
+    close_arr = df["Close"].values
+    open_arr = df["Open"].values
+    atr_arr = atr.values
+    rsi_arr = rsi.values
+    ema_f_arr = ema_fast.values
+    ema_s_arr = ema_slow.values
+    fvg_indices = _build_fvg_index(fvgs)
+    ob_indices = _build_ob_index(obs)
+    dates = df.index
+
+    conf_kw = dict(_close_arr=close_arr, _open_arr=open_arr,
+                   _atr_arr=atr_arr, _rsi_arr=rsi_arr,
+                   _ema_f_arr=ema_f_arr, _ema_s_arr=ema_s_arr,
+                   _fvg_indices=fvg_indices, _ob_indices=ob_indices)
+
     for i in range(2, len(df)):
-        high = df["High"].iloc[i]
-        low = df["Low"].iloc[i]
-        close = df["Close"].iloc[i]
-        prev_close = df["Close"].iloc[i - 1]
-        dt = df.index[i]
+        high = high_arr[i]
+        low = low_arr[i]
+        close = close_arr[i]
+        prev_close = close_arr[i - 1]
+        dt = dates[i]
 
         if session_filter != "all":
             session = get_session(dt)
@@ -569,7 +649,7 @@ def detect_inducement_traps(df: pd.DataFrame, swings: List[SwingPoint],
                                        strength=1, formed_at=now)
                 conf_score, conf_factors = score_confluence(
                     df, i, "short", level, atr, fvgs, obs, rsi,
-                    ema_fast, ema_slow, pip_size)
+                    ema_fast, ema_slow, pip_size, **conf_kw)
 
                 if conf_score < min_confluence:
                     continue
@@ -602,7 +682,7 @@ def detect_inducement_traps(df: pd.DataFrame, swings: List[SwingPoint],
                                        strength=1, formed_at=now)
                 conf_score, conf_factors = score_confluence(
                     df, i, "long", level, atr, fvgs, obs, rsi,
-                    ema_fast, ema_slow, pip_size)
+                    ema_fast, ema_slow, pip_size, **conf_kw)
 
                 if conf_score < min_confluence:
                     continue
@@ -652,15 +732,33 @@ def detect_stop_hunts(df: pd.DataFrame, levels: List[LiquidityLevel],
     if ema_slow is None:
         ema_slow = calc_ema(df["Close"], 50)
 
+    # Pre-extract arrays
+    high_arr = df["High"].values
+    low_arr = df["Low"].values
+    close_arr = df["Close"].values
+    open_arr = df["Open"].values
+    atr_arr = atr.values
+    rsi_arr = rsi.values
+    ema_f_arr = ema_fast.values
+    ema_s_arr = ema_slow.values
+    fvg_indices = _build_fvg_index(fvgs)
+    ob_indices = _build_ob_index(obs)
+    dates = df.index
+
+    conf_kw = dict(_close_arr=close_arr, _open_arr=open_arr,
+                   _atr_arr=atr_arr, _rsi_arr=rsi_arr,
+                   _ema_f_arr=ema_f_arr, _ema_s_arr=ema_s_arr,
+                   _fvg_indices=fvg_indices, _ob_indices=ob_indices)
+
     for level in levels:
         for i in range(2, len(df)):
-            high = df["High"].iloc[i]
-            low = df["Low"].iloc[i]
-            close = df["Close"].iloc[i]
-            open_price = df["Open"].iloc[i]
-            prev_high = df["High"].iloc[i - 1]
-            prev_low = df["Low"].iloc[i - 1]
-            dt = df.index[i]
+            high = high_arr[i]
+            low = low_arr[i]
+            close = close_arr[i]
+            open_price = open_arr[i]
+            prev_high = high_arr[i - 1]
+            prev_low = low_arr[i - 1]
+            dt = dates[i]
 
             if session_filter != "all":
                 session = get_session(dt)
@@ -683,7 +781,7 @@ def detect_stop_hunts(df: pd.DataFrame, levels: List[LiquidityLevel],
 
                     conf_score, conf_factors = score_confluence(
                         df, i, "short", level, atr, fvgs, obs, rsi,
-                        ema_fast, ema_slow, pip_size)
+                        ema_fast, ema_slow, pip_size, **conf_kw)
 
                     if conf_score < min_confluence:
                         continue
@@ -709,7 +807,7 @@ def detect_stop_hunts(df: pd.DataFrame, levels: List[LiquidityLevel],
 
                     conf_score, conf_factors = score_confluence(
                         df, i, "long", level, atr, fvgs, obs, rsi,
-                        ema_fast, ema_slow, pip_size)
+                        ema_fast, ema_slow, pip_size, **conf_kw)
 
                     if conf_score < min_confluence:
                         continue
@@ -759,6 +857,16 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
     ema_s_vals = ema_slow.values
     atr_vals = atr.values
     close_vals = df["Close"].values
+    open_vals = df["Open"].values
+    rsi_vals = rsi.values
+    fvg_indices = _build_fvg_index(fvgs)
+    ob_indices = _build_ob_index(obs)
+    dates = df.index
+
+    conf_kw = dict(_close_arr=close_vals, _open_arr=open_vals,
+                   _atr_arr=atr_vals, _rsi_arr=rsi_vals,
+                   _ema_f_arr=ema_f_vals, _ema_s_arr=ema_s_vals,
+                   _fvg_indices=fvg_indices, _ob_indices=ob_indices)
 
     for i in range(2, len(df)):
         if np.isnan(ema_f_vals[i]) or np.isnan(ema_s_vals[i]):
@@ -766,7 +874,7 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
         if np.isnan(ema_f_vals[i - 1]) or np.isnan(ema_s_vals[i - 1]):
             continue
 
-        dt = df.index[i]
+        dt = dates[i]
         if session_filter != "all":
             session = get_session(dt)
             if session != session_filter and session_filter != "killzones":
@@ -788,8 +896,7 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
             level = LiquidityLevel(price=close, kind="sell_side", strength=1, formed_at=now)
             conf_score, conf_factors = score_confluence(
                 df, i, "long", level, atr, fvgs, obs, rsi,
-                ema_fast, ema_slow, pip_size)
-            # EMA crossover always gets trend_aligned, remove duplicate
+                ema_fast, ema_slow, pip_size, **conf_kw)
             conf_factors = [f for f in conf_factors if f != "trend_aligned"]
             conf_factors.insert(0, "ema_crossover")
 
@@ -816,7 +923,7 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
             level = LiquidityLevel(price=close, kind="buy_side", strength=1, formed_at=now)
             conf_score, conf_factors = score_confluence(
                 df, i, "short", level, atr, fvgs, obs, rsi,
-                ema_fast, ema_slow, pip_size)
+                ema_fast, ema_slow, pip_size, **conf_kw)
             conf_factors = [f for f in conf_factors if f != "trend_aligned"]
             conf_factors.insert(0, "ema_crossover")
 
@@ -869,12 +976,22 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
     low_vals = df["Low"].values
     high_vals = df["High"].values
     atr_vals = atr.values
+    ema_f_vals = ema_fast.values
+    ema_s_vals = ema_slow.values
+    fvg_indices = _build_fvg_index(fvgs)
+    ob_indices = _build_ob_index(obs)
+    dates = df.index
+
+    conf_kw = dict(_close_arr=close_vals, _open_arr=open_vals,
+                   _atr_arr=atr_vals, _rsi_arr=rsi_vals,
+                   _ema_f_arr=ema_f_vals, _ema_s_arr=ema_s_vals,
+                   _fvg_indices=fvg_indices, _ob_indices=ob_indices)
 
     for i in range(2, len(df)):
         if np.isnan(rsi_vals[i]) or np.isnan(rsi_vals[i - 1]):
             continue
 
-        dt = df.index[i]
+        dt = dates[i]
         if session_filter != "all":
             session = get_session(dt)
             if session != session_filter and session_filter != "killzones":
@@ -901,7 +1018,7 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
                                    strength=1, formed_at=now)
             conf_score, conf_factors = score_confluence(
                 df, i, "long", level, atr, fvgs, obs, rsi,
-                ema_fast, ema_slow, pip_size)
+                ema_fast, ema_slow, pip_size, **conf_kw)
             conf_factors.insert(0, "rsi_reversal")
 
             if conf_score < min_confluence:
@@ -931,7 +1048,7 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
                                    strength=1, formed_at=now)
             conf_score, conf_factors = score_confluence(
                 df, i, "short", level, atr, fvgs, obs, rsi,
-                ema_fast, ema_slow, pip_size)
+                ema_fast, ema_slow, pip_size, **conf_kw)
             conf_factors.insert(0, "rsi_reversal")
 
             if conf_score < min_confluence:
@@ -979,8 +1096,24 @@ def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
     swing_lows = [s for s in swings if s.kind == "low"]
     now = pd.Timestamp.now()
 
+    # Pre-extract arrays
+    close_arr = df["Close"].values
+    open_arr = df["Open"].values
+    atr_arr = atr.values
+    rsi_arr = rsi.values
+    ema_f_arr = ema_fast.values
+    ema_s_arr = ema_slow.values
+    fvg_indices = _build_fvg_index(fvgs)
+    ob_indices = _build_ob_index(obs)
+    dates = df.index
+
+    conf_kw = dict(_close_arr=close_arr, _open_arr=open_arr,
+                   _atr_arr=atr_arr, _rsi_arr=rsi_arr,
+                   _ema_f_arr=ema_f_arr, _ema_s_arr=ema_s_arr,
+                   _fvg_indices=fvg_indices, _ob_indices=ob_indices)
+
     for i in range(2, len(df)):
-        dt = df.index[i]
+        dt = dates[i]
         if session_filter != "all":
             session = get_session(dt)
             if session != session_filter and session_filter != "killzones":
@@ -988,13 +1121,13 @@ def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
             if session_filter == "killzones" and not is_in_killzone(dt):
                 continue
 
-        close = df["Close"].iloc[i]
-        prev_close = df["Close"].iloc[i - 1]
-        atr_val = atr.iloc[i]
-        if pd.isna(atr_val) or atr_val == 0:
+        close = close_arr[i]
+        prev_close = close_arr[i - 1]
+        atr_val = atr_arr[i]
+        if np.isnan(atr_val) or atr_val == 0:
             continue
 
-        body = abs(close - df["Open"].iloc[i])
+        body = abs(close - open_arr[i])
 
         # Bullish breakout: close above recent swing high with strong candle
         for sh in swing_highs:
@@ -1011,7 +1144,7 @@ def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
                                        strength=1, formed_at=now)
                 conf_score, conf_factors = score_confluence(
                     df, i, "long", level, atr, fvgs, obs, rsi,
-                    ema_fast, ema_slow, pip_size)
+                    ema_fast, ema_slow, pip_size, **conf_kw)
                 conf_factors.insert(0, "breakout")
 
                 if conf_score < min_confluence:
@@ -1044,7 +1177,7 @@ def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
                                        strength=1, formed_at=now)
                 conf_score, conf_factors = score_confluence(
                     df, i, "short", level, atr, fvgs, obs, rsi,
-                    ema_fast, ema_slow, pip_size)
+                    ema_fast, ema_slow, pip_size, **conf_kw)
                 conf_factors.insert(0, "breakout")
 
                 if conf_score < min_confluence:
@@ -1090,10 +1223,27 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
 
     now = pd.Timestamp.now()
 
+    # Pre-extract arrays
+    close_arr = df["Close"].values
+    open_arr = df["Open"].values
+    low_arr = df["Low"].values
+    high_arr = df["High"].values
+    atr_arr = atr.values
+    rsi_arr = rsi.values
+    ema_f_arr = ema_fast.values
+    ema_s_arr = ema_slow.values
+    fvg_indices = _build_fvg_index(fvgs)
+    ob_indices = _build_ob_index(obs)
+    dates = df.index
+
+    conf_kw = dict(_close_arr=close_arr, _open_arr=open_arr,
+                   _atr_arr=atr_arr, _rsi_arr=rsi_arr,
+                   _ema_f_arr=ema_f_arr, _ema_s_arr=ema_s_arr,
+                   _fvg_indices=fvg_indices, _ob_indices=ob_indices)
+
     for fvg in fvgs:
-        # Look for price to retrace into the FVG within 20 candles
         for i in range(fvg.index + 2, min(fvg.index + 20, len(df))):
-            dt = df.index[i]
+            dt = dates[i]
             if session_filter != "all":
                 session = get_session(dt)
                 if session != session_filter and session_filter != "killzones":
@@ -1101,15 +1251,14 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
                 if session_filter == "killzones" and not is_in_killzone(dt):
                     continue
 
-            close = df["Close"].iloc[i]
-            open_price = df["Open"].iloc[i]
-            atr_val = atr.iloc[i]
-            if pd.isna(atr_val) or atr_val == 0:
+            close = close_arr[i]
+            open_price = open_arr[i]
+            atr_val = atr_arr[i]
+            if np.isnan(atr_val) or atr_val == 0:
                 continue
 
             if fvg.direction == "bullish":
-                # Price dips into bullish FVG and closes bullish
-                if df["Low"].iloc[i] <= fvg.top and close >= fvg.bottom and close > open_price:
+                if low_arr[i] <= fvg.top and close >= fvg.bottom and close > open_price:
                     sl = fvg.bottom - (5 * pip_size)
                     risk = close - sl
                     if risk <= 0:
@@ -1120,7 +1269,7 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
                                            strength=1, formed_at=now)
                     conf_score, conf_factors = score_confluence(
                         df, i, "long", level, atr, fvgs, obs, rsi,
-                        ema_fast, ema_slow, pip_size)
+                        ema_fast, ema_slow, pip_size, **conf_kw)
                     conf_factors.insert(0, "fvg_entry")
 
                     if conf_score < min_confluence:
@@ -1136,11 +1285,10 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
                         confluence_factors=conf_factors,
                         session=get_session(dt),
                     ))
-                    break  # Only one entry per FVG
+                    break
 
             elif fvg.direction == "bearish":
-                # Price rallies into bearish FVG and closes bearish
-                if df["High"].iloc[i] >= fvg.bottom and close <= fvg.top and close < open_price:
+                if high_arr[i] >= fvg.bottom and close <= fvg.top and close < open_price:
                     sl = fvg.top + (5 * pip_size)
                     risk = sl - close
                     if risk <= 0:
@@ -1151,7 +1299,7 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
                                            strength=1, formed_at=now)
                     conf_score, conf_factors = score_confluence(
                         df, i, "short", level, atr, fvgs, obs, rsi,
-                        ema_fast, ema_slow, pip_size)
+                        ema_fast, ema_slow, pip_size, **conf_kw)
                     conf_factors.insert(0, "fvg_entry")
 
                     if conf_score < min_confluence:
@@ -1197,12 +1345,29 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
 
     now = pd.Timestamp.now()
 
+    # Pre-extract arrays
+    close_arr = df["Close"].values
+    open_arr = df["Open"].values
+    low_arr = df["Low"].values
+    high_arr = df["High"].values
+    atr_arr = atr.values
+    rsi_arr = rsi.values
+    ema_f_arr = ema_fast.values
+    ema_s_arr = ema_slow.values
+    fvg_indices = _build_fvg_index(fvgs)
+    ob_indices = _build_ob_index(obs)
+    dates = df.index
+
+    conf_kw = dict(_close_arr=close_arr, _open_arr=open_arr,
+                   _atr_arr=atr_arr, _rsi_arr=rsi_arr,
+                   _ema_f_arr=ema_f_arr, _ema_s_arr=ema_s_arr,
+                   _fvg_indices=fvg_indices, _ob_indices=ob_indices)
+
     for ob in obs:
         if ob.mitigated:
             continue
-        # Look for price to retrace into OB within 30 candles
         for i in range(ob.index + 2, min(ob.index + 30, len(df))):
-            dt = df.index[i]
+            dt = dates[i]
             if session_filter != "all":
                 session = get_session(dt)
                 if session != session_filter and session_filter != "killzones":
@@ -1210,15 +1375,14 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
                 if session_filter == "killzones" and not is_in_killzone(dt):
                     continue
 
-            close = df["Close"].iloc[i]
-            open_price = df["Open"].iloc[i]
-            atr_val = atr.iloc[i]
-            if pd.isna(atr_val) or atr_val == 0:
+            close = close_arr[i]
+            open_price = open_arr[i]
+            atr_val = atr_arr[i]
+            if np.isnan(atr_val) or atr_val == 0:
                 continue
 
             if ob.direction == "bullish":
-                # Price dips into bullish OB zone and bounces
-                if df["Low"].iloc[i] <= ob.high and close >= ob.low and close > open_price:
+                if low_arr[i] <= ob.high and close >= ob.low and close > open_price:
                     sl = ob.low - (5 * pip_size)
                     risk = close - sl
                     if risk <= 0:
@@ -1229,7 +1393,7 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
                                            strength=1, formed_at=now)
                     conf_score, conf_factors = score_confluence(
                         df, i, "long", level, atr, fvgs, obs, rsi,
-                        ema_fast, ema_slow, pip_size)
+                        ema_fast, ema_slow, pip_size, **conf_kw)
                     conf_factors.insert(0, "ob_bounce")
 
                     if conf_score < min_confluence:
@@ -1249,8 +1413,7 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
                     break
 
             elif ob.direction == "bearish":
-                # Price rallies into bearish OB zone and reverses
-                if df["High"].iloc[i] >= ob.low and close <= ob.high and close < open_price:
+                if high_arr[i] >= ob.low and close <= ob.high and close < open_price:
                     sl = ob.high + (5 * pip_size)
                     risk = sl - close
                     if risk <= 0:
@@ -1261,7 +1424,7 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
                                            strength=1, formed_at=now)
                     conf_score, conf_factors = score_confluence(
                         df, i, "short", level, atr, fvgs, obs, rsi,
-                        ema_fast, ema_slow, pip_size)
+                        ema_fast, ema_slow, pip_size, **conf_kw)
                     conf_factors.insert(0, "ob_bounce")
 
                     if conf_score < min_confluence:
