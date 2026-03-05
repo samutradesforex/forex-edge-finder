@@ -47,11 +47,11 @@ def fetch_pair(pair_name: str, period: str = "6mo", interval: str = "1h") -> pd.
     return df
 
 
-def load_csv(path: str) -> pd.DataFrame:
-    """Load forex data from a CSV file.
+def load_csv(path_or_buffer) -> pd.DataFrame:
+    """Load forex data from a CSV file or file-like object.
 
     Expects columns: Datetime (or Date), Open, High, Low, Close.
     """
-    df = pd.read_csv(path, parse_dates=True, index_col=0)
+    df = pd.read_csv(path_or_buffer, parse_dates=True, index_col=0)
     df.index.name = "Datetime"
     return df

@@ -104,6 +104,14 @@ class BacktestResult:
         if not self.trades:
             return
 
+        # Reset aggregated dicts to avoid double-counting on re-computation
+        self.monthly_pnl = {}
+        self.daily_pnl = {}
+        self.hourly_pnl = {}
+        self.session_breakdown = {}
+        self.signal_type_breakdown = {}
+        self.confluence_breakdown = {}
+
         self.total_trades = len(self.trades)
         self.wins = sum(1 for t in self.trades if t.result == "win")
         self.losses = sum(1 for t in self.trades if t.result == "loss")
@@ -607,6 +615,9 @@ def optimize_parameters(
     param_grid: Dict[str, List] = None,
     optimize_for: str = "expectancy",
     top_n: int = 10,
+    strategy: str = "all",
+    interval: str = "",
+    **extra_kwargs,
 ) -> List[OptimizationResult]:
     """Grid search over parameter combinations.
 
@@ -642,7 +653,8 @@ def optimize_parameters(
         params = dict(zip(param_names, combo))
 
         try:
-            bt_result = run_backtest(df, pair_name, **params)
+            bt_result = run_backtest(df, pair_name, strategy=strategy,
+                                        interval=interval, **params)
 
             if bt_result.total_trades < 5:
                 continue

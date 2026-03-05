@@ -451,9 +451,10 @@ def _fetch_cached(pair_name: str, period: str, yf_interval: str, interval: str):
     """Cached data download — avoids re-downloading on every rerun."""
     df = fetch_pair(pair_name, period=period, interval=yf_interval)
     if interval == "4h" and yf_interval == "1h":
-        df = df.resample("4h").agg({
-            "Open": "first", "High": "max", "Low": "min", "Close": "last"
-        }).dropna()
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        if "Volume" in df.columns:
+            agg["Volume"] = "sum"
+        df = df.resample("4h").agg(agg).dropna()
     return df
 
 
@@ -1600,6 +1601,8 @@ if run_btn or optimize_btn:
                     },
                     optimize_for=opt_metric,
                     top_n=20,
+                    strategy=strategy,
+                    interval=interval,
                 )
 
             if opt_results:
