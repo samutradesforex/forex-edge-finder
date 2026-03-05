@@ -4,9 +4,17 @@ Runs in the background, sweeping across all pairs × strategies × timeframes
 × parameter combos to find profitable edges. Persists results to disk so
 they survive restarts. Designed to be driven by a Streamlit background thread
 or a standalone CLI runner.
+
+Features:
+- Walk-forward validation (in-sample train → out-of-sample test)
+- Edge deduplication
+- Resume from crash (tracks last completed position)
+- Smart param filtering (skips irrelevant params per strategy)
+- Proper logging instead of silent exception swallowing
 """
 
 import json
+import logging
 import os
 import time
 import threading
@@ -17,13 +25,15 @@ from pathlib import Path
 from typing import List, Dict, Optional, Callable
 
 import pandas as pd
+import numpy as np
 
 from data.loader import FOREX_PAIRS, fetch_pair
-from engine.backtester import run_backtest, optimize_parameters, BacktestResult
+from engine.backtester import run_backtest, BacktestResult
 from engine.liquidity import (
     get_pip_size, calc_atr, calc_rsi, calc_ema, find_fvgs, find_order_blocks,
 )
 
+logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -44,6 +54,19 @@ PARAM_GRID = {
     "min_confluence": [0, 1, 2, 3],
 }
 
+# Which params actually affect each strategy (skip irrelevant combos)
+STRATEGY_PARAMS = {
+    "sweeps":        ["swing_lookback", "cluster_pips", "min_wick_pips", "rr_ratio", "min_confluence"],
+    "inducement":    ["swing_lookback", "rr_ratio", "min_confluence"],
+    "stop_hunts":    ["swing_lookback", "cluster_pips", "rr_ratio", "min_confluence"],
+    "smc":           ["swing_lookback", "cluster_pips", "min_wick_pips", "rr_ratio", "min_confluence"],
+    "ema_crossover": ["rr_ratio", "min_confluence"],
+    "rsi_reversal":  ["rr_ratio", "min_confluence"],
+    "breakout":      ["swing_lookback", "rr_ratio", "min_confluence"],
+    "fvg_entry":     ["rr_ratio", "min_confluence"],
+    "ob_bounce":     ["rr_ratio", "min_confluence"],
+}
+
 # Minimum thresholds for a strategy to be considered an "edge"
 EDGE_THRESHOLDS = {
     "min_trades": 10,
@@ -52,6 +75,10 @@ EDGE_THRESHOLDS = {
     "min_expectancy_pips": 1.0,
     "min_sharpe": 0.3,
 }
+
+# Walk-forward validation settings
+WALK_FORWARD_SPLIT = 0.7  # 70% in-sample, 30% out-of-sample
+WALK_FORWARD_DECAY = 0.5  # OOS must retain at least 50% of in-sample performance
 
 
 @dataclass
@@ -71,13 +98,23 @@ class DiscoveredEdge:
     score: float
     discovered_at: str = ""
     period: str = "6mo"
+    # Walk-forward validation fields
+    oos_win_rate: float = 0.0
+    oos_profit_factor: float = 0.0
+    oos_expectancy_pips: float = 0.0
+    oos_total_trades: int = 0
+    oos_sharpe_ratio: float = 0.0
+    validated: bool = False
 
     def to_dict(self):
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d):
-        return cls(**d)
+        # Handle edges saved before validation fields existed
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in d.items() if k in valid_fields}
+        return cls(**filtered)
 
 
 @dataclass
@@ -90,9 +127,14 @@ class DiscoveryState:
     combos_tested: int = 0
     total_combos: int = 0
     edges_found: int = 0
+    edges_validated: int = 0
     elapsed_seconds: float = 0.0
     error: str = ""
     edges: List[DiscoveredEdge] = field(default_factory=list)
+    # Resume tracking
+    last_completed_pair: str = ""
+    last_completed_interval: str = ""
+    last_completed_strategy: str = ""
 
     @property
     def progress_pct(self) -> float:
@@ -110,7 +152,15 @@ def _ensure_dir():
 def save_edges(edges: List[DiscoveredEdge], filename: str = "edges.json"):
     _ensure_dir()
     path = RESULTS_DIR / filename
-    data = [e.to_dict() for e in edges]
+    # Deduplicate before saving
+    seen = set()
+    unique = []
+    for e in edges:
+        key = (e.pair, e.interval, e.strategy, tuple(sorted(e.params.items())))
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+    data = [e.to_dict() for e in unique]
     path.write_text(json.dumps(data, indent=2, default=str))
 
 
@@ -121,7 +171,8 @@ def load_edges(filename: str = "edges.json") -> List[DiscoveredEdge]:
     try:
         data = json.loads(path.read_text())
         return [DiscoveredEdge.from_dict(d) for d in data]
-    except (json.JSONDecodeError, TypeError, KeyError):
+    except (json.JSONDecodeError, TypeError, KeyError) as e:
+        logger.warning("Failed to load edges from %s: %s", path, e)
         return []
 
 
@@ -136,8 +187,12 @@ def save_state(state: DiscoveryState, filename: str = "state.json"):
         "combos_tested": state.combos_tested,
         "total_combos": state.total_combos,
         "edges_found": state.edges_found,
+        "edges_validated": state.edges_validated,
         "elapsed_seconds": state.elapsed_seconds,
         "error": state.error,
+        "last_completed_pair": state.last_completed_pair,
+        "last_completed_interval": state.last_completed_interval,
+        "last_completed_strategy": state.last_completed_strategy,
     }
     path.write_text(json.dumps(d, indent=2))
 
@@ -149,8 +204,11 @@ def load_state(filename: str = "state.json") -> DiscoveryState:
     try:
         d = json.loads(path.read_text())
         return DiscoveryState(**{k: v for k, v in d.items()
-                                 if k != "edges"})
-    except (json.JSONDecodeError, TypeError, KeyError):
+                                 if k != "edges" and k in {
+                                     f.name for f in DiscoveryState.__dataclass_fields__.values()
+                                 }})
+    except (json.JSONDecodeError, TypeError, KeyError) as e:
+        logger.warning("Failed to load state: %s", e)
         return DiscoveryState()
 
 
@@ -195,6 +253,115 @@ def compute_edge_score(bt: BacktestResult) -> float:
     return round(score, 2)
 
 
+# ── Walk-forward validation ──────────────────────────────────────────────
+
+def walk_forward_validate(
+    df: pd.DataFrame, pair: str, strategy: str, interval: str,
+    params: dict, precomputed_is: dict = None,
+    split: float = WALK_FORWARD_SPLIT,
+    decay: float = WALK_FORWARD_DECAY,
+    thresholds: dict = None,
+) -> Optional[Dict]:
+    """Run walk-forward validation: train on first portion, test on rest.
+
+    Returns dict with OOS metrics if validated, None if failed.
+    """
+    n = len(df)
+    split_idx = int(n * split)
+
+    if split_idx < 50 or (n - split_idx) < 30:
+        return None
+
+    # Out-of-sample data
+    df_oos = df.iloc[split_idx:].copy()
+    if len(df_oos) < 30:
+        return None
+
+    try:
+        # Compute indicators for OOS portion
+        pip_size = get_pip_size(pair)
+        oos_precomputed = {
+            "atr": calc_atr(df_oos),
+            "rsi": calc_rsi(df_oos),
+            "ema_fast": calc_ema(df_oos["Close"], 21),
+            "ema_slow": calc_ema(df_oos["Close"], 50),
+            "fvgs": find_fvgs(df_oos, pip_size=pip_size),
+            "obs": find_order_blocks(df_oos, pip_size=pip_size),
+        }
+
+        bt_oos = run_backtest(
+            df_oos, pair, strategy=strategy, interval=interval,
+            _precomputed=oos_precomputed, **params,
+        )
+
+        if bt_oos.total_trades < 5:
+            return None
+
+        # Check OOS performance meets minimum thresholds
+        t = thresholds or EDGE_THRESHOLDS
+        oos_ok = (
+            bt_oos.win_rate >= t["min_win_rate"] * decay and
+            bt_oos.profit_factor >= max(t["min_profit_factor"] * decay, 1.0) and
+            bt_oos.expectancy_pips > 0
+        )
+
+        if not oos_ok:
+            return None
+
+        return {
+            "oos_win_rate": round(bt_oos.win_rate, 1),
+            "oos_profit_factor": round(min(bt_oos.profit_factor, 99.9), 2),
+            "oos_expectancy_pips": round(bt_oos.expectancy_pips, 1),
+            "oos_total_trades": bt_oos.total_trades,
+            "oos_sharpe_ratio": round(bt_oos.sharpe_ratio, 2),
+            "validated": True,
+        }
+
+    except Exception as e:
+        logger.debug("Walk-forward validation error for %s %s %s: %s",
+                     pair, strategy, interval, e)
+        return None
+
+
+# ── Smart param grid ─────────────────────────────────────────────────────
+
+def _get_strategy_combos(strategy: str, param_grid: dict) -> List[Dict]:
+    """Get only the relevant parameter combinations for a strategy."""
+    relevant_params = STRATEGY_PARAMS.get(strategy, list(param_grid.keys()))
+    param_names = [p for p in relevant_params if p in param_grid]
+    param_values = [param_grid[p] for p in param_names]
+
+    # For params not relevant to this strategy, use defaults
+    default_values = {
+        "swing_lookback": 5,
+        "cluster_pips": 10.0,
+        "min_wick_pips": 3.0,
+        "rr_ratio": 2.0,
+        "min_confluence": 0,
+    }
+
+    combos = []
+    for combo in product(*param_values):
+        params = dict(zip(param_names, combo))
+        # Fill in defaults for non-relevant params
+        for key in param_grid:
+            if key not in params:
+                params[key] = default_values.get(key, param_grid[key][0])
+        combos.append(params)
+
+    return combos
+
+
+def _count_total_combos(strategies: List[str], intervals: List[str],
+                        pairs: List[str], param_grid: dict) -> int:
+    """Count total combos accounting for smart param filtering."""
+    total = 0
+    for strat in strategies:
+        combos = _get_strategy_combos(strat, param_grid)
+        total += len(combos) * len(intervals) * len(pairs)
+    return total
+
+
 # ── Core discovery loop ───────────────────────────────────────────────────
 
 def _fetch_data(pair: str, period: str, interval: str) -> Optional[pd.DataFrame]:
@@ -208,9 +375,11 @@ def _fetch_data(pair: str, period: str, interval: str) -> Optional[pd.DataFrame]
                 agg["Volume"] = "sum"
             df = df.resample("4h").agg(agg).dropna()
         if len(df) < 50:
+            logger.warning("Insufficient data for %s %s: %d rows", pair, interval, len(df))
             return None
         return df
-    except Exception:
+    except Exception as e:
+        logger.error("Failed to fetch data for %s %s: %s", pair, interval, e)
         return None
 
 
@@ -237,11 +406,14 @@ def run_discovery(
     state: DiscoveryState = None,
     stop_event: threading.Event = None,
     on_progress: Callable = None,
+    validate: bool = True,
+    resume: bool = False,
 ) -> DiscoveryState:
     """Run a full discovery sweep.
 
     Iterates across pairs × intervals × strategies × param combos.
-    Saves edges to disk incrementally.
+    Saves edges to disk incrementally. Uses smart param filtering
+    and walk-forward validation.
 
     Args:
         pairs: Currency pairs to scan (defaults to all)
@@ -253,6 +425,8 @@ def run_discovery(
         state: Existing state to resume from
         stop_event: Threading event to signal stop
         on_progress: Callback(state) called after each pair/strategy combo
+        validate: Whether to run walk-forward validation on edges
+        resume: Whether to resume from last saved position
     """
     if pairs is None:
         pairs = list(FOREX_PAIRS.keys())
@@ -262,18 +436,19 @@ def run_discovery(
         intervals = ALL_INTERVALS
     if param_grid is None:
         param_grid = PARAM_GRID
-    if state is None:
-        state = DiscoveryState()
     if stop_event is None:
         stop_event = threading.Event()
 
-    # Compute total work
-    param_names = list(param_grid.keys())
-    param_values = list(param_grid.values())
-    param_combos = list(product(*param_values))
-    num_param_combos = len(param_combos)
-    state.total_combos = len(pairs) * len(intervals) * len(strategies) * num_param_combos
+    # Resume from saved state if requested
+    if resume and state is None:
+        state = load_state()
+        if state.status not in ("paused", "running"):
+            state = DiscoveryState()
+    if state is None:
+        state = DiscoveryState()
 
+    # Compute total work with smart filtering
+    state.total_combos = _count_total_combos(strategies, intervals, pairs, param_grid)
     state.status = "running"
     state.edges = load_edges()
     t0 = time.time()
@@ -283,6 +458,12 @@ def run_discovery(
          tuple(sorted(e.params.items())))
         for e in state.edges
     }
+
+    # Determine resume position
+    should_skip = resume and state.last_completed_pair
+    skip_pair = state.last_completed_pair if should_skip else ""
+    skip_interval = state.last_completed_interval if should_skip else ""
+    skip_strategy = state.last_completed_strategy if should_skip else ""
 
     for pair in pairs:
         for intv in intervals:
@@ -294,13 +475,27 @@ def run_discovery(
             state.current_pair = pair
             state.current_interval = intv
 
+            # Resume: skip already-completed pair/interval/strategy combos
+            if should_skip:
+                if pair < skip_pair or (pair == skip_pair and intv < skip_interval):
+                    for strat in strategies:
+                        combos = _get_strategy_combos(strat, param_grid)
+                        state.combos_tested += len(combos)
+                    continue
+
             df = _fetch_data(pair, period, intv)
             if df is None:
-                state.combos_tested += len(strategies) * num_param_combos
+                for strat in strategies:
+                    combos = _get_strategy_combos(strat, param_grid)
+                    state.combos_tested += len(combos)
                 continue
 
-            # Pre-compute indicators once per pair/interval
-            precomputed = _precompute_indicators(df, pair)
+            # For walk-forward: split data
+            split_idx = int(len(df) * WALK_FORWARD_SPLIT)
+            df_is = df.iloc[:split_idx].copy() if validate and split_idx >= 50 else df
+
+            # Pre-compute indicators for in-sample portion
+            precomputed = _precompute_indicators(df_is, pair)
 
             for strat in strategies:
                 if stop_event.is_set():
@@ -308,11 +503,21 @@ def run_discovery(
                     save_state(state)
                     return state
 
+                # Resume: skip completed strategies
+                if should_skip and pair == skip_pair and intv == skip_interval:
+                    if strat <= skip_strategy:
+                        combos = _get_strategy_combos(strat, param_grid)
+                        state.combos_tested += len(combos)
+                        if strat == skip_strategy:
+                            should_skip = False  # Done skipping
+                        continue
+
                 state.current_strategy = strat
 
-                for combo in param_combos:
-                    params = dict(zip(param_names, combo))
+                # Smart param filtering: only test relevant params
+                strategy_combos = _get_strategy_combos(strat, param_grid)
 
+                for params in strategy_combos:
                     # Skip already-discovered combos
                     key = (pair, intv, strat, tuple(sorted(params.items())))
                     if key in existing_keys:
@@ -321,7 +526,7 @@ def run_discovery(
 
                     try:
                         bt = run_backtest(
-                            df, pair, strategy=strat, interval=intv,
+                            df_is, pair, strategy=strat, interval=intv,
                             _precomputed=precomputed, **params,
                         )
 
@@ -342,6 +547,29 @@ def run_discovery(
                                 discovered_at=datetime.now().isoformat(),
                                 period=period,
                             )
+
+                            # Walk-forward validation
+                            if validate and len(df) > len(df_is) + 30:
+                                oos_result = walk_forward_validate(
+                                    df, pair, strat, intv, params,
+                                    thresholds=thresholds,
+                                )
+                                if oos_result:
+                                    edge.oos_win_rate = oos_result["oos_win_rate"]
+                                    edge.oos_profit_factor = oos_result["oos_profit_factor"]
+                                    edge.oos_expectancy_pips = oos_result["oos_expectancy_pips"]
+                                    edge.oos_total_trades = oos_result["oos_total_trades"]
+                                    edge.oos_sharpe_ratio = oos_result["oos_sharpe_ratio"]
+                                    edge.validated = True
+                                    state.edges_validated += 1
+                                    logger.info(
+                                        "VALIDATED edge: %s %s %s WR=%.1f%% PF=%.2f "
+                                        "OOS_WR=%.1f%% OOS_PF=%.2f",
+                                        pair, intv, strat, edge.win_rate,
+                                        edge.profit_factor, edge.oos_win_rate,
+                                        edge.oos_profit_factor,
+                                    )
+
                             state.edges.append(edge)
                             state.edges_found += 1
                             existing_keys.add(key)
@@ -350,11 +578,15 @@ def run_discovery(
                             if state.edges_found % 10 == 0:
                                 save_edges(state.edges)
 
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Backtest error %s %s %s: %s", pair, strat, intv, e)
 
                     state.combos_tested += 1
 
+                # Track completion for resume
+                state.last_completed_pair = pair
+                state.last_completed_interval = intv
+                state.last_completed_strategy = strat
                 state.elapsed_seconds = time.time() - t0
                 save_state(state)
                 if on_progress:
@@ -386,12 +618,14 @@ def start_discovery_background(
     thresholds: dict = None,
     continuous: bool = True,
     restart_delay: int = 300,
+    validate: bool = True,
 ) -> bool:
     """Start discovery in a background thread. Returns True if started.
 
     Args:
         continuous: If True, automatically restart after each full sweep
         restart_delay: Seconds to wait between sweeps (default 5 min)
+        validate: Whether to run walk-forward validation
     """
     global _bg_thread, _bg_stop_event, _bg_state
 
@@ -412,9 +646,10 @@ def start_discovery_background(
                         pairs=pairs, strategies=strategies, intervals=intervals,
                         period=period, param_grid=param_grid, thresholds=thresholds,
                         state=DiscoveryState(), stop_event=_bg_stop_event,
+                        validate=validate,
                     )
-                except Exception:
-                    pass  # don't let crashes kill the loop
+                except Exception as e:
+                    logger.error("Discovery sweep %d failed: %s", sweep_num, e)
 
                 if not continuous or _bg_stop_event.is_set():
                     break
@@ -463,27 +698,56 @@ def main():
                         help="Timeframes (default: 1h 4h 1d)")
     parser.add_argument("--period", default="6mo",
                         help="Data period (default: 6mo)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from last saved position")
+    parser.add_argument("--no-validate", action="store_true",
+                        help="Skip walk-forward validation")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable verbose logging")
     args = parser.parse_args()
 
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    last_line_len = 0
+
     def _progress(state):
+        nonlocal last_line_len
         pct = state.progress_pct
         eta = ""
         if state.combos_tested > 0 and pct > 0:
             remaining = state.elapsed_seconds / pct * (100 - pct)
             eta = f" | ETA: {remaining/60:.0f}m"
-        print(
-            f"\r[{pct:5.1f}%] {state.current_pair} {state.current_interval} "
+
+        # Use \n for log-file compatibility instead of \r
+        line = (
+            f"[{pct:5.1f}%] {state.current_pair} {state.current_interval} "
             f"{state.current_strategy} | "
-            f"{state.edges_found} edges found | "
-            f"{state.combos_tested}/{state.total_combos}{eta}",
-            end="", flush=True,
+            f"{state.edges_found} edges ({state.edges_validated} validated) | "
+            f"{state.combos_tested}/{state.total_combos}{eta}"
         )
+
+        if os.isatty(1):
+            # Terminal: use \r for clean output
+            padding = max(0, last_line_len - len(line))
+            print(f"\r{line}{' ' * padding}", end="", flush=True)
+            last_line_len = len(line)
+        else:
+            # File/pipe: use newlines
+            print(line, flush=True)
 
     print("Starting Forex Edge Discovery...")
     print(f"Pairs: {args.pairs or 'all'}")
     print(f"Strategies: {args.strategies or 'all'}")
     print(f"Intervals: {args.intervals or ALL_INTERVALS}")
     print(f"Period: {args.period}")
+    print(f"Walk-forward validation: {'OFF' if args.no_validate else 'ON'}")
+    print(f"Resume: {'YES' if args.resume else 'NO'}")
     print()
 
     state = run_discovery(
@@ -492,22 +756,39 @@ def main():
         intervals=args.intervals,
         period=args.period,
         on_progress=_progress,
+        validate=not args.no_validate,
+        resume=args.resume,
     )
 
     print(f"\n\nDiscovery complete!")
     print(f"Tested: {state.combos_tested} combos in {state.elapsed_seconds:.0f}s")
-    print(f"Edges found: {state.edges_found}")
+    print(f"Edges found: {state.edges_found} ({state.edges_validated} validated)")
 
     if state.edges:
-        print(f"\nTop 10 edges:")
-        print(f"{'Pair':<10} {'TF':<4} {'Strategy':<16} {'Trades':>6} {'WR':>6} "
-              f"{'Pips':>8} {'PF':>6} {'Sharpe':>7} {'Score':>7}")
-        print("-" * 80)
-        for e in state.edges[:10]:
-            print(f"{e.pair:<10} {e.interval:<4} {e.strategy:<16} "
-                  f"{e.total_trades:>6} {e.win_rate:>5.1f}% "
-                  f"{e.total_pips:>+7.1f} {e.profit_factor:>6.2f} "
-                  f"{e.sharpe_ratio:>7.2f} {e.score:>7.1f}")
+        validated = [e for e in state.edges if e.validated]
+        unvalidated = [e for e in state.edges if not e.validated]
+
+        if validated:
+            print(f"\nTop 10 VALIDATED edges:")
+            print(f"{'Pair':<10} {'TF':<4} {'Strategy':<16} {'Trades':>6} {'WR':>6} "
+                  f"{'PF':>6} {'OOS_WR':>7} {'OOS_PF':>7} {'Score':>7}")
+            print("-" * 80)
+            for e in sorted(validated, key=lambda x: x.score, reverse=True)[:10]:
+                print(f"{e.pair:<10} {e.interval:<4} {e.strategy:<16} "
+                      f"{e.total_trades:>6} {e.win_rate:>5.1f}% "
+                      f"{e.profit_factor:>6.2f} {e.oos_win_rate:>6.1f}% "
+                      f"{e.oos_profit_factor:>7.2f} {e.score:>7.1f}")
+
+        if unvalidated:
+            print(f"\nTop 5 unvalidated edges (use with caution):")
+            print(f"{'Pair':<10} {'TF':<4} {'Strategy':<16} {'Trades':>6} {'WR':>6} "
+                  f"{'Pips':>8} {'PF':>6} {'Score':>7}")
+            print("-" * 70)
+            for e in sorted(unvalidated, key=lambda x: x.score, reverse=True)[:5]:
+                print(f"{e.pair:<10} {e.interval:<4} {e.strategy:<16} "
+                      f"{e.total_trades:>6} {e.win_rate:>5.1f}% "
+                      f"{e.total_pips:>+7.1f} {e.profit_factor:>6.2f} "
+                      f"{e.score:>7.1f}")
 
     print(f"\nResults saved to {RESULTS_DIR}/")
 

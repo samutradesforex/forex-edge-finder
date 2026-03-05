@@ -12,6 +12,7 @@ venv/
 ENV/
 .streamlit/secrets.toml
 data/*.csv
+data/.cache/
 *.pkl
 .DS_Store
 discovery_results/

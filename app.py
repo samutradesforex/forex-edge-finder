@@ -1797,7 +1797,8 @@ with tab_discovery:
             p1.metric("Combos Tested", f"{_disc_state.combos_tested:,}")
             p2.metric("Total Combos", f"{_disc_state.total_combos:,}")
             p3.metric("Edges Found", _disc_state.edges_found)
-            p4.metric("Elapsed", f"{_disc_state.elapsed_seconds / 60:.1f}m")
+            _validated = getattr(_disc_state, 'edges_validated', 0)
+            p4.metric("Validated", f"{_validated} / {_disc_state.edges_found}")
 
             if st.button("Refresh", key="disc_refresh"):
                 st.rerun()
@@ -1840,10 +1841,15 @@ with tab_discovery:
 
         _filtered.sort(key=lambda e: e.score, reverse=True)
 
+        _show_validated = st.checkbox("Show only validated edges", value=False, key="disc_validated")
+        if _show_validated:
+            _filtered = [e for e in _filtered if getattr(e, 'validated', False)]
+
         _edge_data = []
         for i, e in enumerate(_filtered[:50]):
             _param_str = ", ".join(f"{k}={v}" for k, v in e.params.items())
-            _edge_data.append({
+            _is_validated = getattr(e, 'validated', False)
+            row = {
                 "#": i + 1,
                 "Pair": e.pair,
                 "TF": e.interval,
@@ -1856,8 +1862,12 @@ with tab_discovery:
                 "Sharpe": f"{e.sharpe_ratio:.2f}",
                 "Max DD": f"{e.max_drawdown_pips:.1f}",
                 "Score": f"{e.score:.1f}",
+                "OOS WR": f"{getattr(e, 'oos_win_rate', 0):.0f}%" if _is_validated else "-",
+                "OOS PF": f"{getattr(e, 'oos_profit_factor', 0):.2f}" if _is_validated else "-",
+                "Valid": "Yes" if _is_validated else "No",
                 "Params": _param_str,
-            })
+            }
+            _edge_data.append(row)
 
         if _edge_data:
             st.dataframe(pd.DataFrame(_edge_data), use_container_width=True, hide_index=True)
