@@ -384,8 +384,15 @@ def start_discovery_background(
     period: str = "6mo",
     param_grid: dict = None,
     thresholds: dict = None,
+    continuous: bool = True,
+    restart_delay: int = 300,
 ) -> bool:
-    """Start discovery in a background thread. Returns True if started."""
+    """Start discovery in a background thread. Returns True if started.
+
+    Args:
+        continuous: If True, automatically restart after each full sweep
+        restart_delay: Seconds to wait between sweeps (default 5 min)
+    """
     global _bg_thread, _bg_stop_event, _bg_state
 
     with _bg_lock:
@@ -397,11 +404,28 @@ def start_discovery_background(
 
         def _run():
             global _bg_state
-            _bg_state = run_discovery(
-                pairs=pairs, strategies=strategies, intervals=intervals,
-                period=period, param_grid=param_grid, thresholds=thresholds,
-                state=_bg_state, stop_event=_bg_stop_event,
-            )
+            sweep_num = 0
+            while not _bg_stop_event.is_set():
+                sweep_num += 1
+                try:
+                    _bg_state = run_discovery(
+                        pairs=pairs, strategies=strategies, intervals=intervals,
+                        period=period, param_grid=param_grid, thresholds=thresholds,
+                        state=DiscoveryState(), stop_event=_bg_stop_event,
+                    )
+                except Exception:
+                    pass  # don't let crashes kill the loop
+
+                if not continuous or _bg_stop_event.is_set():
+                    break
+
+                # Wait between sweeps, checking stop_event every second
+                _bg_state.status = "waiting"
+                save_state(_bg_state)
+                for _ in range(restart_delay):
+                    if _bg_stop_event.is_set():
+                        break
+                    time.sleep(1)
 
         _bg_thread = threading.Thread(target=_run, daemon=True)
         _bg_thread.start()

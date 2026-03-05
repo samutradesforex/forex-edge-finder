@@ -1746,14 +1746,20 @@ with tab_discovery:
     with disc_col1:
         _disc_running = is_discovery_running()
         _disc_state = get_discovery_state()
+        _disc_active = _disc_running or _disc_state.status == "waiting"
 
         btn_col1, btn_col2, btn_col3 = st.columns(3)
+        _btn_label = "Start Discovery"
+        if _disc_running:
+            _btn_label = "Running..."
+        elif _disc_state.status == "waiting":
+            _btn_label = "Waiting for next sweep..."
         start_disc = btn_col1.button(
-            "Start Discovery" if not _disc_running else "Running...",
-            type="primary", disabled=_disc_running, use_container_width=True,
+            _btn_label,
+            type="primary", disabled=_disc_active, use_container_width=True,
         )
         stop_disc = btn_col2.button(
-            "Stop", disabled=not _disc_running, use_container_width=True,
+            "Stop", disabled=not _disc_active, use_container_width=True,
         )
         clear_disc = btn_col3.button("Clear Results", use_container_width=True)
 
@@ -1769,7 +1775,7 @@ with tab_discovery:
                 st.toast("Discovery started! This runs in the background.")
                 st.rerun()
 
-        if stop_disc and _disc_running:
+        if stop_disc and _disc_active:
             stop_discovery_background()
             st.toast("Stopping discovery...")
             st.rerun()
@@ -1780,11 +1786,12 @@ with tab_discovery:
             st.rerun()
 
         # Progress display
-        if _disc_running:
-            st.progress(_disc_state.progress_pct / 100,
-                        text=f"{_disc_state.progress_pct:.1f}% — {_disc_state.current_pair} "
-                             f"{_disc_state.current_interval} {_disc_state.current_strategy} "
-                             f"| {_disc_state.edges_found} edges found")
+        if _disc_running or _disc_state.status == "waiting":
+            if _disc_state.status != "waiting":
+                st.progress(_disc_state.progress_pct / 100,
+                            text=f"{_disc_state.progress_pct:.1f}% — {_disc_state.current_pair} "
+                                 f"{_disc_state.current_interval} {_disc_state.current_strategy} "
+                                 f"| {_disc_state.edges_found} edges found")
 
             p1, p2, p3, p4 = st.columns(4)
             p1.metric("Combos Tested", f"{_disc_state.combos_tested:,}")
@@ -1795,6 +1802,11 @@ with tab_discovery:
             if st.button("Refresh", key="disc_refresh"):
                 st.rerun()
 
+        elif _disc_state.status == "waiting":
+            st.info(
+                f"Sweep complete — {_disc_state.edges_found} edges found. "
+                f"Next sweep starts automatically in ~5 min. Running continuously."
+            )
         elif _disc_state.status == "completed":
             st.success(
                 f"Discovery complete — {_disc_state.combos_tested:,} combos tested, "
