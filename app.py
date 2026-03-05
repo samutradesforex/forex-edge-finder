@@ -15,6 +15,12 @@ from engine.backtester import run_backtest, optimize_parameters
 from engine.structure import compute_structure, get_bias_at
 from engine.sizing import simulate_account
 from engine.scanner import scan_all_pairs, scan_summary_df
+from engine.discovery import (
+    start_discovery_background, stop_discovery_background,
+    get_discovery_state, is_discovery_running,
+    load_edges, save_edges, DiscoveryState, ALL_STRATEGIES, ALL_INTERVALS,
+    PARAM_GRID, EDGE_THRESHOLDS,
+)
 
 st.set_page_config(
     page_title="Forex Edge Finder",
@@ -441,8 +447,8 @@ with st.sidebar:
 
 # ── Tab layout ──────────────────────────────────────────────────────────────
 
-tab_results, tab_analysis, tab_account, tab_chart, tab_trades, tab_optimize, tab_scanner = st.tabs([
-    "Overview", "Analytics", "Account Sim", "Chart", "Trade Log", "Optimizer", "Scanner"
+tab_results, tab_analysis, tab_account, tab_chart, tab_trades, tab_optimize, tab_scanner, tab_discovery = st.tabs([
+    "Overview", "Analytics", "Account Sim", "Chart", "Trade Log", "Optimizer", "Scanner", "Auto-Discovery"
 ])
 
 
@@ -1717,3 +1723,160 @@ elif not run_btn and not optimize_btn and not scan_btn:
             - **Deep Analytics** — Monthly/daily/hourly P&L, session & signal breakdowns
             - **Export** — CSV trade logs + text reports
             """)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AUTO-DISCOVERY TAB (always visible, independent of run/optimize buttons)
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_discovery:
+    section("Auto-Discovery Engine")
+    st.caption(
+        "Continuously sweeps all pairs, strategies, timeframes, and parameter combos "
+        "to find profitable edges. Results persist across sessions."
+    )
+
+    disc_col1, disc_col2 = st.columns([3, 1])
+
+    with disc_col2:
+        disc_period = st.selectbox("Discovery period", ["3mo", "6mo", "1y"], index=1,
+                                    key="disc_period")
+        disc_min_trades = st.number_input("Min trades", value=10, min_value=3, key="disc_min_tr")
+        disc_min_pf = st.number_input("Min profit factor", value=1.2, step=0.1, key="disc_min_pf")
+
+    with disc_col1:
+        _disc_running = is_discovery_running()
+        _disc_state = get_discovery_state()
+
+        btn_col1, btn_col2, btn_col3 = st.columns(3)
+        start_disc = btn_col1.button(
+            "Start Discovery" if not _disc_running else "Running...",
+            type="primary", disabled=_disc_running, use_container_width=True,
+        )
+        stop_disc = btn_col2.button(
+            "Stop", disabled=not _disc_running, use_container_width=True,
+        )
+        clear_disc = btn_col3.button("Clear Results", use_container_width=True)
+
+        if start_disc and not _disc_running:
+            _disc_thresholds = {
+                **EDGE_THRESHOLDS,
+                "min_trades": disc_min_trades,
+                "min_profit_factor": disc_min_pf,
+            }
+            if start_discovery_background(
+                period=disc_period, thresholds=_disc_thresholds,
+            ):
+                st.toast("Discovery started! This runs in the background.")
+                st.rerun()
+
+        if stop_disc and _disc_running:
+            stop_discovery_background()
+            st.toast("Stopping discovery...")
+            st.rerun()
+
+        if clear_disc:
+            save_edges([])
+            st.toast("Results cleared.")
+            st.rerun()
+
+        # Progress display
+        if _disc_running:
+            st.progress(_disc_state.progress_pct / 100,
+                        text=f"{_disc_state.progress_pct:.1f}% — {_disc_state.current_pair} "
+                             f"{_disc_state.current_interval} {_disc_state.current_strategy} "
+                             f"| {_disc_state.edges_found} edges found")
+
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Combos Tested", f"{_disc_state.combos_tested:,}")
+            p2.metric("Total Combos", f"{_disc_state.total_combos:,}")
+            p3.metric("Edges Found", _disc_state.edges_found)
+            p4.metric("Elapsed", f"{_disc_state.elapsed_seconds / 60:.1f}m")
+
+            if st.button("Refresh", key="disc_refresh"):
+                st.rerun()
+
+        elif _disc_state.status == "completed":
+            st.success(
+                f"Discovery complete — {_disc_state.combos_tested:,} combos tested, "
+                f"{_disc_state.edges_found} edges found in "
+                f"{_disc_state.elapsed_seconds/60:.1f} min"
+            )
+        elif _disc_state.status == "paused":
+            st.warning("Discovery paused. Click Start to resume.")
+
+    # Display discovered edges
+    _disc_edges = load_edges()
+    if _disc_edges:
+        section(f"Discovered Edges ({len(_disc_edges)})")
+
+        f1, f2, f3 = st.columns(3)
+        _edge_pairs = sorted(set(e.pair for e in _disc_edges))
+        _edge_strats = sorted(set(e.strategy for e in _disc_edges))
+        _edge_intervals = sorted(set(e.interval for e in _disc_edges))
+
+        _fp = f1.multiselect("Filter pair", _edge_pairs, key="disc_fp")
+        _fs = f2.multiselect("Filter strategy", _edge_strats, key="disc_fs")
+        _fi = f3.multiselect("Filter interval", _edge_intervals, key="disc_fi")
+
+        _filtered = _disc_edges
+        if _fp:
+            _filtered = [e for e in _filtered if e.pair in _fp]
+        if _fs:
+            _filtered = [e for e in _filtered if e.strategy in _fs]
+        if _fi:
+            _filtered = [e for e in _filtered if e.interval in _fi]
+
+        _filtered.sort(key=lambda e: e.score, reverse=True)
+
+        _edge_data = []
+        for i, e in enumerate(_filtered[:50]):
+            _param_str = ", ".join(f"{k}={v}" for k, v in e.params.items())
+            _edge_data.append({
+                "#": i + 1,
+                "Pair": e.pair,
+                "TF": e.interval,
+                "Strategy": e.strategy,
+                "Trades": e.total_trades,
+                "Win Rate": f"{e.win_rate:.0f}%",
+                "Net Pips": f"{e.total_pips:+.1f}",
+                "PF": f"{e.profit_factor:.2f}",
+                "Expect": f"{e.expectancy_pips:+.1f}",
+                "Sharpe": f"{e.sharpe_ratio:.2f}",
+                "Max DD": f"{e.max_drawdown_pips:.1f}",
+                "Score": f"{e.score:.1f}",
+                "Params": _param_str,
+            })
+
+        if _edge_data:
+            st.dataframe(pd.DataFrame(_edge_data), use_container_width=True, hide_index=True)
+
+            _top_n = min(20, len(_filtered))
+            _chart_edges = _filtered[:_top_n]
+            _edge_fig = go.Figure(go.Bar(
+                x=[f"{e.pair} {e.interval} {e.strategy}" for e in _chart_edges],
+                y=[e.score for e in _chart_edges],
+                marker_color=[GREEN if e.total_pips > 0 else RED for e in _chart_edges],
+                text=[f"{e.score:.0f}" for e in _chart_edges],
+                textposition="outside",
+            ))
+            _edge_fig.update_layout(**CHART_LAYOUT, height=380,
+                                     yaxis_title="Edge Score", xaxis_title="Strategy",
+                                     xaxis_tickangle=-45)
+            st.plotly_chart(_edge_fig, use_container_width=True)
+
+            _strat_counts = {}
+            for e in _filtered:
+                _strat_counts[e.strategy] = _strat_counts.get(e.strategy, 0) + 1
+            _dist_fig = go.Figure(go.Pie(
+                labels=list(_strat_counts.keys()),
+                values=list(_strat_counts.values()),
+                marker_colors=[BLUE, GREEN, GOLD, CYAN, RED, "#d2a8ff", "#f97583",
+                               "#7ee787", "#ffa657"][:len(_strat_counts)],
+                textinfo="label+value",
+            ))
+            _dist_fig.update_layout(**CHART_LAYOUT, height=300, showlegend=False)
+            st.plotly_chart(_dist_fig, use_container_width=True)
+        else:
+            st.info("No edges match current filters.")
+    elif not _disc_running:
+        st.info("No edges discovered yet. Click **Start Discovery** to begin scanning.")
