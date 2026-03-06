@@ -1,0 +1,221 @@
+"""Edge Explorer tab — deep-dive into any discovered edge."""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from ui.components import (
+    section, edge_badge, edge_score_badge, fmt_pf,
+    equity_curve_chart, monthly_pnl_chart, win_rate_donut,
+    pnl_distribution_chart,
+)
+from ui.theme import GREEN, RED, GOLD, BLUE, CYAN, CHART_LAYOUT, CHART_LEGEND_H
+from engine.discovery import load_edges
+from engine.backtester import run_backtest
+from data.loader import fetch_max_data
+
+
+def render():
+    """Render the Edge Explorer tab."""
+    edges = load_edges()
+    if not edges:
+        st.info(
+            "No edges to explore. Run **Discovery** first to find edges, "
+            "then come back here to analyze them in detail."
+        )
+        return
+
+    # ── Edge selector ──
+    validated = [e for e in edges if getattr(e, "validated", False)]
+    display_edges = validated if validated else edges
+    display_edges = sorted(display_edges, key=lambda e: e.score, reverse=True)
+
+    edge_labels = [
+        f"#{i+1} | {e.pair} {e.interval} {e.strategy.replace('_',' ').title()} "
+        f"| Score {e.score:.0f} | WR {e.win_rate:.0f}% | PF {e.profit_factor:.2f}"
+        + (" [VALIDATED]" if getattr(e, "validated", False) else "")
+        for i, e in enumerate(display_edges)
+    ]
+
+    section("Select Edge to Explore")
+    selected_idx = st.selectbox(
+        "Edge", range(len(edge_labels)),
+        format_func=lambda i: edge_labels[i],
+        key="edge_select", label_visibility="collapsed",
+    )
+
+    edge = display_edges[selected_idx]
+
+    # ── Edge header ──
+    is_validated = getattr(edge, "validated", False)
+    st.markdown(f"""
+    <div style="display:flex; align-items:center; gap:12px; margin:8px 0 16px 0; flex-wrap:wrap;">
+        <span style="color:#e6edf3; font-size:1.2rem; font-weight:700;">
+            {edge.pair} &middot; {edge.interval.upper()} &middot;
+            {edge.strategy.replace('_',' ').title()}
+        </span>
+        {edge_score_badge(edge.score)}
+        {"<span class='edge-badge edge-strong'>VALIDATED</span>" if is_validated else ""}
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── In-sample vs Out-of-sample comparison ──
+    section("Performance Summary")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Trades", edge.total_trades)
+    c2.metric("Win Rate", f"{edge.win_rate:.1f}%")
+    c3.metric("Profit Factor", f"{edge.profit_factor:.2f}")
+    c4.metric("Expectancy", f"{edge.expectancy_pips:+.1f}p")
+    c5.metric("Sharpe", f"{edge.sharpe_ratio:.2f}")
+    c6.metric("Max DD", f"{edge.max_drawdown_pips:.1f}p")
+
+    if is_validated:
+        section("Walk-Forward Validation (Out-of-Sample)")
+        o1, o2, o3, o4, o5 = st.columns(5)
+        o1.metric("OOS Trades", edge.oos_total_trades)
+        o2.metric("OOS Win Rate", f"{edge.oos_win_rate:.1f}%",
+                  delta=f"{edge.oos_win_rate - edge.win_rate:+.1f}%")
+        o3.metric("OOS PF", f"{edge.oos_profit_factor:.2f}",
+                  delta=f"{edge.oos_profit_factor - edge.profit_factor:+.2f}")
+        o4.metric("OOS Expectancy", f"{edge.oos_expectancy_pips:+.1f}p",
+                  delta=f"{edge.oos_expectancy_pips - edge.expectancy_pips:+.1f}p")
+        o5.metric("OOS Sharpe", f"{edge.oos_sharpe_ratio:.2f}",
+                  delta=f"{edge.oos_sharpe_ratio - edge.sharpe_ratio:+.2f}")
+
+        # IS vs OOS comparison chart
+        metrics = ["Win Rate", "Profit Factor", "Sharpe"]
+        is_vals = [edge.win_rate / 100, edge.profit_factor / 3, edge.sharpe_ratio / 3]
+        oos_vals = [edge.oos_win_rate / 100, edge.oos_profit_factor / 3,
+                    edge.oos_sharpe_ratio / 3]
+
+        comp_fig = go.Figure()
+        comp_fig.add_trace(go.Bar(
+            x=metrics, y=[edge.win_rate, edge.profit_factor, edge.sharpe_ratio],
+            name="In-Sample", marker_color=BLUE,
+        ))
+        comp_fig.add_trace(go.Bar(
+            x=metrics, y=[edge.oos_win_rate, edge.oos_profit_factor,
+                          edge.oos_sharpe_ratio],
+            name="Out-of-Sample", marker_color=GREEN,
+        ))
+        comp_fig.update_layout(**CHART_LAYOUT, height=280, barmode="group",
+                               legend=CHART_LEGEND_H)
+        st.plotly_chart(comp_fig, use_container_width=True)
+
+    # ── Parameters ──
+    section("Strategy Parameters")
+    param_cols = st.columns(len(edge.params))
+    for col, (k, v) in zip(param_cols, edge.params.items()):
+        col.metric(k.replace("_", " ").title(), v)
+
+    # ── Full backtest replay ──
+    section("Full Backtest Replay")
+    if st.button("Run Full Backtest for This Edge", type="primary",
+                 use_container_width=True, key="replay_btn"):
+        with st.spinner(f"Fetching data and running backtest for {edge.pair} {edge.interval}..."):
+            try:
+                df = fetch_max_data(edge.pair, edge.interval)
+                result = run_backtest(
+                    df, edge.pair, strategy=edge.strategy,
+                    interval=edge.interval, **edge.params,
+                )
+                st.session_state["explorer_result"] = result
+                st.session_state["explorer_edge"] = edge
+            except Exception as e:
+                st.error(f"Backtest failed: {e}")
+                return
+
+    # Show cached result if available
+    result = st.session_state.get("explorer_result")
+    cached_edge = st.session_state.get("explorer_edge")
+
+    if result and cached_edge and cached_edge.pair == edge.pair and \
+       cached_edge.strategy == edge.strategy and cached_edge.interval == edge.interval:
+        _render_full_result(result, edge)
+    else:
+        st.caption(
+            "Click the button above to run a full backtest and see equity curve, "
+            "trade log, and detailed analytics for this edge."
+        )
+
+
+def _render_full_result(result, edge):
+    """Render full backtest result for an edge."""
+    if not result.trades:
+        st.warning("No trades generated.")
+        return
+
+    # ── Metrics refresh ──
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Total Trades", result.total_trades)
+    m2.metric("Win Rate", f"{result.win_rate:.1f}%")
+    m3.metric("Net Pips", f"{result.total_pips:+.1f}")
+    m4.metric("Profit Factor", fmt_pf(result.profit_factor))
+    m5.metric("Expectancy", f"{result.expectancy_pips:+.1f}p")
+    m6.metric("Max Drawdown", f"{result.max_drawdown_pips:.1f}p")
+
+    badge = edge_badge(result)
+    st.markdown(badge, unsafe_allow_html=True)
+
+    # ── Equity curve ──
+    section("Equity Curve")
+    fig = equity_curve_chart(result.equity_curve, height=340)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Win rate + Monthly PnL ──
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        section("Win/Loss Split")
+        donut = win_rate_donut(result.wins, result.losses,
+                                result.breakevens, result.win_rate)
+        st.plotly_chart(donut, use_container_width=True)
+
+    with col2:
+        section("Monthly P&L")
+        if result.monthly_pnl:
+            m_fig = monthly_pnl_chart(result.monthly_pnl, result.trades)
+            st.plotly_chart(m_fig, use_container_width=True)
+
+    # ── Risk metrics ──
+    section("Risk Metrics")
+    r1, r2, r3, r4, r5, r6 = st.columns(6)
+    r1.metric("Sharpe", fmt_pf(result.sharpe_ratio))
+    r2.metric("Sortino", fmt_pf(result.sortino_ratio))
+    r3.metric("Calmar", fmt_pf(result.calmar_ratio))
+    r4.metric("Recovery", fmt_pf(result.recovery_factor))
+    r5.metric("Win Streak", result.max_consecutive_wins)
+    r6.metric("Loss Streak", result.max_consecutive_losses)
+
+    # ── PnL distribution ──
+    section("PnL Distribution")
+    pnls = [t.pnl_pips for t in result.trades]
+    win_pnls = [p for p in pnls if p > 0]
+    loss_pnls = [p for p in pnls if p < 0]
+    avg_pnl = np.mean(pnls)
+    dist_fig = pnl_distribution_chart(win_pnls, loss_pnls, avg_pnl)
+    st.plotly_chart(dist_fig, use_container_width=True)
+
+    # ── Trade log ──
+    section("Trade Log")
+    trade_data = [{
+        "#": i + 1,
+        "Entry": t.entry_datetime.strftime("%Y-%m-%d %H:%M"),
+        "Exit": t.exit_datetime.strftime("%Y-%m-%d %H:%M"),
+        "Dir": t.direction.upper(),
+        "Type": t.signal_type.replace("_", " ").title(),
+        "PnL": f"{t.pnl_pips:+.1f}",
+        "Result": t.result.upper(),
+        "Conf": t.confluence_score,
+        "Session": (t.session or "-").replace("_", " ").title(),
+        "Bars": t.holding_candles,
+    } for i, t in enumerate(result.trades)]
+    st.dataframe(pd.DataFrame(trade_data), use_container_width=True,
+                 hide_index=True, height=400)
+
+    # Export
+    csv = pd.DataFrame(trade_data).to_csv(index=False)
+    st.download_button("Export Trade Log (CSV)", csv,
+                       f"edge_{edge.pair}_{edge.strategy}_trades.csv",
+                       "text/csv", use_container_width=True)

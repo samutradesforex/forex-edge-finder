@@ -32,6 +32,7 @@ from engine.backtester import run_backtest, BacktestResult
 from engine.liquidity import (
     get_pip_size, calc_atr, calc_rsi, calc_ema, find_fvgs, find_order_blocks,
 )
+from engine.strategies import registry as strategy_registry
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +40,8 @@ logger = logging.getLogger(__name__)
 
 RESULTS_DIR = Path("discovery_results")
 
-ALL_STRATEGIES = [
-    "sweeps", "inducement", "stop_hunts", "smc",
-    "ema_crossover", "rsi_reversal", "breakout", "fvg_entry", "ob_bounce",
-]
+# Derive strategy list from registry (auto-discovers new strategies)
+ALL_STRATEGIES = strategy_registry.list()
 
 ALL_INTERVALS = ["1h", "4h", "1d"]
 
@@ -54,17 +53,10 @@ PARAM_GRID = {
     "min_confluence": [0, 1, 2, 3],
 }
 
-# Which params actually affect each strategy (skip irrelevant combos)
+# Derive relevant params from registry (auto-discovers new strategies)
 STRATEGY_PARAMS = {
-    "sweeps":        ["swing_lookback", "cluster_pips", "min_wick_pips", "rr_ratio", "min_confluence"],
-    "inducement":    ["swing_lookback", "rr_ratio", "min_confluence"],
-    "stop_hunts":    ["swing_lookback", "cluster_pips", "rr_ratio", "min_confluence"],
-    "smc":           ["swing_lookback", "cluster_pips", "min_wick_pips", "rr_ratio", "min_confluence"],
-    "ema_crossover": ["rr_ratio", "min_confluence"],
-    "rsi_reversal":  ["rr_ratio", "min_confluence"],
-    "breakout":      ["swing_lookback", "rr_ratio", "min_confluence"],
-    "fvg_entry":     ["rr_ratio", "min_confluence"],
-    "ob_bounce":     ["rr_ratio", "min_confluence"],
+    name: strategy_registry.relevant_params_for(name)
+    for name in ALL_STRATEGIES
 }
 
 # Minimum thresholds for a strategy to be considered an "edge"

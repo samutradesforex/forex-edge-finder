@@ -36,6 +36,9 @@ from engine.liquidity import (
     calc_ema,
 )
 
+# Import strategy registry (triggers auto-discovery of strategy modules)
+from engine.strategies import registry as strategy_registry
+
 
 @dataclass
 class Trade:
@@ -541,31 +544,39 @@ def run_backtest(
         rr_ratio=rr_ratio,
     )
 
-    # Generate signals
+    # Generate signals via strategy registry
     signals = []
+    active_strategies = strategy_registry.resolve_names(strategy)
 
-    # SMC / Liquidity strategies
-    if strategy in ("sweeps", "both", "all", "smc"):
-        signals.extend(detect_liquidity_sweeps(
-            df, levels, min_wick_pips=min_wick_pips, **detect_kwargs))
-    if strategy in ("inducement", "both", "all", "smc"):
-        signals.extend(detect_inducement_traps(df, swings, **detect_kwargs))
-    if strategy in ("stop_hunts", "all", "smc"):
-        sh_kwargs = {k: v for k, v in detect_kwargs.items()
-                     if k != "require_displacement"}
-        signals.extend(detect_stop_hunts(df, levels, **sh_kwargs))
+    # Extra positional args needed by specific strategies
+    _strategy_extra_args = {
+        "sweeps": (levels,),
+        "inducement": (swings,),
+        "stop_hunts": (levels,),
+        "breakout": (swings,),
+    }
+    # Extra keyword args per strategy
+    _strategy_extra_kwargs = {
+        "sweeps": {"min_wick_pips": min_wick_pips},
+    }
+    # stop_hunts doesn't accept require_displacement
+    _strategy_exclude_kwargs = {
+        "stop_hunts": {"require_displacement"},
+    }
 
-    # Common strategies
-    if strategy in ("ema_crossover", "all"):
-        signals.extend(detect_ema_crossover(df, **detect_kwargs))
-    if strategy in ("rsi_reversal", "all"):
-        signals.extend(detect_rsi_reversal(df, **detect_kwargs))
-    if strategy in ("breakout", "all"):
-        signals.extend(detect_breakout(df, swings, **detect_kwargs))
-    if strategy in ("fvg_entry", "all"):
-        signals.extend(detect_fvg_entry(df, **detect_kwargs))
-    if strategy in ("ob_bounce", "all"):
-        signals.extend(detect_ob_bounce(df, **detect_kwargs))
+    for strat_name in active_strategies:
+        meta = strategy_registry.get(strat_name)
+        if meta is None:
+            continue
+        extra_args = _strategy_extra_args.get(strat_name, ())
+        extra_kw = _strategy_extra_kwargs.get(strat_name, {})
+        exclude_kw = _strategy_exclude_kwargs.get(strat_name, set())
+        kw = {k: v for k, v in detect_kwargs.items() if k not in exclude_kw}
+        kw.update(extra_kw)
+        try:
+            signals.extend(meta.detect(df, *extra_args, **kw))
+        except Exception:
+            pass  # Skip broken strategies gracefully
 
     # Sort by time
     signals.sort(key=lambda s: s.entry_index)
