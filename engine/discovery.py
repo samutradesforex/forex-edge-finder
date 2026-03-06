@@ -234,7 +234,8 @@ def load_state(filename: str = "state.json") -> DiscoveryState:
     if not path.exists():
         return DiscoveryState()
     try:
-        d = json.loads(path.read_text())
+        with _file_lock:
+            d = json.loads(path.read_text())
         return DiscoveryState(**{k: v for k, v in d.items()
                                  if k != "edges" and k in {
                                      f.name for f in DiscoveryState.__dataclass_fields__.values()
