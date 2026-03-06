@@ -124,6 +124,8 @@ _CSS = """
     .status-idle { background: #484f58; }
     .status-paused { background: #ffd700; }
     .status-waiting { background: #58a6ff; box-shadow: 0 0 6px #58a6ff; }
+    .status-crashed { background: #f85149; box-shadow: 0 0 8px #f85149; animation: pulse-crash 1s infinite; }
+    @keyframes pulse-crash { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
 
     /* ── Stat pills ── */
     .stat-pill {

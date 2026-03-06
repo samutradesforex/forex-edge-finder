@@ -7,6 +7,7 @@ from ui.theme import GREEN, RED, GOLD, BLUE, CYAN, CHART_LAYOUT
 from engine.discovery import (
     is_discovery_running, get_discovery_state, load_edges,
     start_discovery_background, stop_discovery_background,
+    get_discovery_health, auto_start_discovery,
     EDGE_THRESHOLDS,
 )
 from data.loader import get_cache_stats
@@ -17,6 +18,7 @@ def render():
     # ── Discovery status banner ──
     _running = is_discovery_running()
     _state = get_discovery_state()
+    _health = get_discovery_health()
     _active = _running or _state.status == "waiting"
 
     if _active:
@@ -25,6 +27,8 @@ def render():
         _status = "completed"
     elif _state.status == "paused":
         _status = "paused"
+    elif _state.status == "crashed":
+        _status = "crashed"
     else:
         _status = "idle"
 
@@ -44,6 +48,24 @@ def render():
             f"Last sweep: {_state.combos_tested:,} combos tested, "
             f"{_state.edges_found} edges found in {_state.elapsed_seconds/60:.1f}m"
         )
+    elif _status == "crashed":
+        st.error(f"Discovery crashed: {_state.error}")
+
+    # ── Health monitor (compact) ──
+    if _health["crash_count"] > 0 or _health["sweep_count"] > 1:
+        with st.expander("Engine Health", expanded=_health["crash_count"] > 0):
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Sweeps", _health["sweep_count"])
+            h2.metric("Crashes", _health["crash_count"],
+                       delta=None if _health["crash_count"] == 0
+                       else f"-{_health['crash_count']} recovered",
+                       delta_color="inverse")
+            hb = _health["seconds_since_heartbeat"]
+            h3.metric("Heartbeat",
+                       f"{hb:.0f}s ago" if hb >= 0 else "N/A")
+            h4.metric("Lifetime Edges", _health["total_edges_lifetime"])
+            if _health["error"]:
+                st.caption(f"Last error: {_health['error']}")
 
     # ── Quick actions ──
     btn1, btn2, btn3 = st.columns(3)
@@ -58,6 +80,14 @@ def render():
             stop_discovery_background()
             st.toast("Stopping...")
             st.rerun()
+
+    # Auto-restart button if crashed
+    if _status == "crashed":
+        if btn2.button("Restart Discovery", type="primary",
+                       use_container_width=True):
+            if auto_start_discovery():
+                st.toast("Discovery restarted!")
+                st.rerun()
 
     # ── Edge overview metrics ──
     edges = load_edges()

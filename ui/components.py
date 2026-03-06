@@ -73,6 +73,7 @@ def status_indicator(status: str) -> str:
         "paused": "status-paused",
         "waiting": "status-waiting",
         "completed": "status-running",
+        "crashed": "status-crashed",
     }
     cls = cls_map.get(status, "status-idle")
     label = status.upper()

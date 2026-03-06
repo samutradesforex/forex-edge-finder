@@ -10,7 +10,11 @@ Features:
 - Edge deduplication
 - Resume from crash (tracks last completed position)
 - Smart param filtering (skips irrelevant params per strategy)
-- Proper logging instead of silent exception swallowing
+- Network retry with exponential backoff
+- Auto-start on app load (no button click needed)
+- Crash recovery with automatic thread restart
+- File logging for unattended operation
+- Thread health monitoring
 """
 
 import json
@@ -18,6 +22,7 @@ import logging
 import os
 import time
 import threading
+import traceback
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from itertools import product
@@ -35,6 +40,28 @@ from engine.liquidity import (
 from engine.strategies import registry as strategy_registry
 
 logger = logging.getLogger(__name__)
+
+# ── File logging for unattended operation ─────────────────────────────────
+_log_configured = False
+
+def _setup_file_logging():
+    """Configure file logging so discovery runs are traceable even unattended."""
+    global _log_configured
+    if _log_configured:
+        return
+    _log_configured = True
+    log_path = Path("discovery.log")
+    handler = logging.FileHandler(log_path, mode="a")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    handler.setLevel(logging.INFO)
+    root = logging.getLogger()
+    # Only add if no file handler already exists
+    if not any(isinstance(h, logging.FileHandler) for h in root.handlers):
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -141,6 +168,16 @@ def _ensure_dir():
     RESULTS_DIR.mkdir(exist_ok=True)
 
 
+_file_lock = threading.Lock()
+
+
+def _atomic_write(path: Path, content: str):
+    """Write file atomically via temp file + rename to prevent corruption."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)  # atomic on POSIX
+
+
 def save_edges(edges: List[DiscoveredEdge], filename: str = "edges.json"):
     _ensure_dir()
     path = RESULTS_DIR / filename
@@ -153,7 +190,8 @@ def save_edges(edges: List[DiscoveredEdge], filename: str = "edges.json"):
             seen.add(key)
             unique.append(e)
     data = [e.to_dict() for e in unique]
-    path.write_text(json.dumps(data, indent=2, default=str))
+    with _file_lock:
+        _atomic_write(path, json.dumps(data, indent=2, default=str))
 
 
 def load_edges(filename: str = "edges.json") -> List[DiscoveredEdge]:
@@ -161,7 +199,8 @@ def load_edges(filename: str = "edges.json") -> List[DiscoveredEdge]:
     if not path.exists():
         return []
     try:
-        data = json.loads(path.read_text())
+        with _file_lock:
+            data = json.loads(path.read_text())
         return [DiscoveredEdge.from_dict(d) for d in data]
     except (json.JSONDecodeError, TypeError, KeyError) as e:
         logger.warning("Failed to load edges from %s: %s", path, e)
@@ -186,7 +225,8 @@ def save_state(state: DiscoveryState, filename: str = "state.json"):
         "last_completed_interval": state.last_completed_interval,
         "last_completed_strategy": state.last_completed_strategy,
     }
-    path.write_text(json.dumps(d, indent=2))
+    with _file_lock:
+        _atomic_write(path, json.dumps(d, indent=2))
 
 
 def load_state(filename: str = "state.json") -> DiscoveryState:
@@ -366,31 +406,47 @@ def _count_total_combos(strategies: List[str], intervals: List[str],
 
 # ── Core discovery loop ───────────────────────────────────────────────────
 
-def _fetch_data(pair: str, period: str, interval: str,
-                use_max: bool = False) -> Optional[pd.DataFrame]:
-    """Fetch data for a pair/interval, handling the 4h resample.
+def _fetch_data_with_retry(pair: str, period: str, interval: str,
+                           use_max: bool = False,
+                           max_retries: int = 3) -> Optional[pd.DataFrame]:
+    """Fetch data for a pair/interval with exponential backoff retry.
 
-    Args:
-        use_max: If True, fetch maximum available history (better for discovery)
+    Retries on network errors and rate limits, which are critical for
+    24/7 unattended operation where yfinance may temporarily fail.
     """
-    try:
-        if use_max:
-            df = fetch_max_data(pair, interval)
-        else:
-            yf_interval = "1h" if interval == "4h" else interval
-            df = fetch_pair(pair, period=period, interval=yf_interval)
-            if interval == "4h":
-                agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-                if "Volume" in df.columns:
-                    agg["Volume"] = "sum"
-                df = df.resample("4h").agg(agg).dropna()
-        if len(df) < 50:
-            logger.warning("Insufficient data for %s %s: %d rows", pair, interval, len(df))
-            return None
-        return df
-    except Exception as e:
-        logger.error("Failed to fetch data for %s %s: %s", pair, interval, e)
-        return None
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            if use_max:
+                df = fetch_max_data(pair, interval)
+            else:
+                yf_interval = "1h" if interval == "4h" else interval
+                df = fetch_pair(pair, period=period, interval=yf_interval)
+                if interval == "4h":
+                    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+                    if "Volume" in df.columns:
+                        agg["Volume"] = "sum"
+                    df = df.resample("4h").agg(agg).dropna()
+            if len(df) < 50:
+                logger.warning("Insufficient data for %s %s: %d rows",
+                               pair, interval, len(df))
+                return None
+            return df
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                logger.warning(
+                    "Fetch attempt %d/%d failed for %s %s: %s. Retrying in %ds...",
+                    attempt + 1, max_retries + 1, pair, interval, e, wait,
+                )
+                time.sleep(wait)
+            else:
+                logger.error(
+                    "All %d fetch attempts failed for %s %s: %s",
+                    max_retries + 1, pair, interval, last_error,
+                )
+    return None
 
 
 def _precompute_indicators(df: pd.DataFrame, pair: str) -> dict:
@@ -497,7 +553,7 @@ def run_discovery(
                         state.combos_tested += len(combos)
                     continue
 
-            df = _fetch_data(pair, period, intv, use_max=True)
+            df = _fetch_data_with_retry(pair, period, intv, use_max=True)
             if df is None:
                 for strat in strategies:
                     combos = _get_strategy_combos(strat, param_grid)
@@ -622,6 +678,10 @@ _bg_thread: Optional[threading.Thread] = None
 _bg_stop_event = threading.Event()
 _bg_state = DiscoveryState()
 _bg_lock = threading.Lock()
+_bg_crash_count = 0
+_bg_last_heartbeat = 0.0
+_bg_sweep_count = 0
+_bg_total_edges_lifetime = 0
 
 
 def start_discovery_background(
@@ -637,34 +697,116 @@ def start_discovery_background(
 ) -> bool:
     """Start discovery in a background thread. Returns True if started.
 
-    Args:
-        continuous: If True, automatically restart after each full sweep
-        restart_delay: Seconds to wait between sweeps (default 5 min)
-        validate: Whether to run walk-forward validation
+    Features:
+    - Crash recovery: auto-restarts on unhandled exceptions (up to 10 times)
+    - Heartbeat: updates timestamp so UI can detect zombie threads
+    - State accumulation: edges persist correctly across sweeps
+    - File logging: all activity logged to discovery.log
     """
     global _bg_thread, _bg_stop_event, _bg_state
+    global _bg_crash_count, _bg_last_heartbeat, _bg_sweep_count
+
+    # Ensure file logging is active for unattended operation
+    _setup_file_logging()
 
     with _bg_lock:
         if _bg_thread is not None and _bg_thread.is_alive():
             return False  # already running
 
         _bg_stop_event.clear()
+        _bg_crash_count = 0
+        _bg_last_heartbeat = time.time()
+
+        # Load existing state if available (supports resume across app restarts)
+        existing_edges = load_edges()
         _bg_state = DiscoveryState()
+        _bg_state.edges = existing_edges
+        _bg_state.edges_found = len(existing_edges)
+        _bg_state.edges_validated = sum(1 for e in existing_edges if e.validated)
 
         def _run():
-            global _bg_state
-            sweep_num = 0
+            global _bg_state, _bg_crash_count, _bg_last_heartbeat
+            global _bg_sweep_count, _bg_total_edges_lifetime
+            max_crashes = 10
+            crash_backoff = 30  # seconds to wait after crash before retry
+
+            logger.info(
+                "Discovery background thread started. continuous=%s, "
+                "restart_delay=%ds, validate=%s, existing_edges=%d",
+                continuous, restart_delay, validate, len(_bg_state.edges),
+            )
+
             while not _bg_stop_event.is_set():
-                sweep_num += 1
+                _bg_sweep_count += 1
+                sweep_start = time.time()
+                _bg_last_heartbeat = time.time()
+
                 try:
+                    logger.info(
+                        "Starting sweep #%d (crashes so far: %d)",
+                        _bg_sweep_count, _bg_crash_count,
+                    )
+
+                    # Create fresh state for this sweep but carry forward edges
+                    sweep_state = DiscoveryState()
+                    sweep_state.edges = load_edges()  # Always load latest from disk
+                    sweep_state.edges_found = 0  # Count new edges this sweep
+                    sweep_state.edges_validated = 0
+
                     _bg_state = run_discovery(
                         pairs=pairs, strategies=strategies, intervals=intervals,
                         period=period, param_grid=param_grid, thresholds=thresholds,
-                        state=DiscoveryState(), stop_event=_bg_stop_event,
+                        state=sweep_state, stop_event=_bg_stop_event,
                         validate=validate,
                     )
+
+                    _bg_last_heartbeat = time.time()
+                    _bg_total_edges_lifetime += _bg_state.edges_found
+                    _bg_crash_count = 0  # Reset crash counter on successful sweep
+
+                    elapsed = time.time() - sweep_start
+                    logger.info(
+                        "Sweep #%d complete in %.0fs. %d new edges (%d validated). "
+                        "Total edges on disk: %d",
+                        _bg_sweep_count, elapsed,
+                        _bg_state.edges_found, _bg_state.edges_validated,
+                        len(_bg_state.edges),
+                    )
+
                 except Exception as e:
-                    logger.error("Discovery sweep %d failed: %s", sweep_num, e)
+                    _bg_crash_count += 1
+                    _bg_last_heartbeat = time.time()
+                    logger.error(
+                        "Discovery sweep #%d CRASHED (crash #%d/%d): %s\n%s",
+                        _bg_sweep_count, _bg_crash_count, max_crashes,
+                        e, traceback.format_exc(),
+                    )
+                    _bg_state.error = f"Crash #{_bg_crash_count}: {e}"
+                    save_state(_bg_state)
+
+                    if _bg_crash_count >= max_crashes:
+                        logger.critical(
+                            "Discovery exceeded max crashes (%d). Stopping.",
+                            max_crashes,
+                        )
+                        _bg_state.status = "crashed"
+                        _bg_state.error = (
+                            f"Stopped after {max_crashes} consecutive crashes. "
+                            f"Last error: {e}"
+                        )
+                        save_state(_bg_state)
+                        break
+
+                    # Exponential backoff on crash (30s, 60s, 120s, ...)
+                    wait = crash_backoff * (2 ** (_bg_crash_count - 1))
+                    wait = min(wait, 600)  # Cap at 10 minutes
+                    logger.info("Waiting %ds before restart...", wait)
+                    for _ in range(int(wait)):
+                        if _bg_stop_event.is_set():
+                            break
+                        time.sleep(1)
+                        _bg_last_heartbeat = time.time()
+                    continue  # Retry the sweep
 
                 if not continuous or _bg_stop_event.is_set():
                     break
@@ -672,19 +814,27 @@ def start_discovery_background(
                 # Wait between sweeps, checking stop_event every second
                 _bg_state.status = "waiting"
                 save_state(_bg_state)
-                for _ in range(restart_delay):
+                logger.info(
+                    "Waiting %ds before next sweep...", restart_delay,
+                )
+                for i in range(restart_delay):
                     if _bg_stop_event.is_set():
                         break
                     time.sleep(1)
+                    _bg_last_heartbeat = time.time()
 
-        _bg_thread = threading.Thread(target=_run, daemon=True)
+            logger.info("Discovery background thread exiting.")
+
+        _bg_thread = threading.Thread(target=_run, daemon=True, name="discovery-bg")
         _bg_thread.start()
+        logger.info("Discovery background thread launched (thread=%s).", _bg_thread.name)
         return True
 
 
 def stop_discovery_background():
     """Signal the background discovery to stop."""
     _bg_stop_event.set()
+    logger.info("Discovery stop signal sent.")
 
 
 def get_discovery_state() -> DiscoveryState:
@@ -697,6 +847,35 @@ def is_discovery_running() -> bool:
     """Check if discovery is currently running."""
     with _bg_lock:
         return _bg_thread is not None and _bg_thread.is_alive()
+
+
+def get_discovery_health() -> Dict:
+    """Get health info for the discovery thread. Used by dashboard for monitoring."""
+    with _bg_lock:
+        alive = _bg_thread is not None and _bg_thread.is_alive()
+    return {
+        "alive": alive,
+        "crash_count": _bg_crash_count,
+        "sweep_count": _bg_sweep_count,
+        "total_edges_lifetime": _bg_total_edges_lifetime,
+        "last_heartbeat": _bg_last_heartbeat,
+        "seconds_since_heartbeat": time.time() - _bg_last_heartbeat if _bg_last_heartbeat > 0 else -1,
+        "status": _bg_state.status,
+        "error": _bg_state.error,
+    }
+
+
+def auto_start_discovery() -> bool:
+    """Auto-start discovery if not already running. Called on app load.
+
+    This is the key function that makes the system truly autonomous —
+    discovery begins immediately when the app starts, no button click needed.
+    Returns True if discovery was started, False if already running.
+    """
+    if is_discovery_running():
+        return False
+    logger.info("Auto-starting discovery engine...")
+    return start_discovery_background(continuous=True)
 
 
 # ── CLI runner ─────────────────────────────────────────────────────────────
