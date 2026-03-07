@@ -279,10 +279,12 @@ class BacktestResult:
 
 def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                    pip_size: float, spread_pips: float = 0.0,
+                   slippage_pips: float = 0.3,
                    trailing_sl: bool = False, trailing_activation_rr: float = 1.0,
                    break_even_rr: float = 0.0,
                    partial_tp_rr: float = 0.0, partial_tp_pct: float = 0.5,
                    _high_arr: np.ndarray = None, _low_arr: np.ndarray = None,
+                   _open_arr: np.ndarray = None,
                    ) -> Optional[Trade]:
     """Simulate a single trade with advanced exit logic.
 
@@ -291,6 +293,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
         df: Price data
         pip_size: Pip size for the pair
         spread_pips: Spread cost in pips
+        slippage_pips: Slippage cost in pips (adverse fill)
         trailing_sl: Enable trailing stop loss
         trailing_activation_rr: RR multiple to activate trailing
         break_even_rr: RR multiple to move SL to break-even (0 = disabled)
@@ -298,6 +301,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
         partial_tp_pct: Percentage of position to close at partial TP
         _high_arr: Pre-extracted High values array (performance optimization)
         _low_arr: Pre-extracted Low values array (performance optimization)
+        _open_arr: Pre-extracted Open values array (for gap detection)
     """
     entry_price = signal.entry_price
     sl = signal.stop_loss
@@ -312,15 +316,60 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
     max_adverse = 0.0
     partial_closed = False
     effective_pnl_multiplier = 1.0
+    total_cost_pips = spread_pips + slippage_pips  # Combined execution cost
 
     # Use pre-extracted arrays for speed (avoid .iloc per candle)
     high_arr = _high_arr if _high_arr is not None else df["High"].values
     low_arr = _low_arr if _low_arr is not None else df["Low"].values
+    open_arr = _open_arr if _open_arr is not None else df["Open"].values
     n = len(df)
 
     for j in range(signal.entry_index + 1, n):
         candle_high = high_arr[j]
         candle_low = low_arr[j]
+        candle_open = open_arr[j]
+
+        # Gap detection: if price gaps through SL on open, exit at gap price
+        if signal.direction == "long" and candle_open < current_sl:
+            pnl = ((candle_open - entry_price) / pip_size) * effective_pnl_multiplier
+            if partial_closed:
+                partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
+                pnl += partial_pnl
+            pnl -= total_cost_pips
+            result = "win" if pnl > 0 else ("breakeven" if pnl == 0 else "loss")
+            return Trade(
+                entry_datetime=signal.entry_datetime, exit_datetime=df.index[j],
+                direction="long", entry_price=signal.entry_price,
+                exit_price=candle_open, stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit, pnl_pips=round(pnl, 1),
+                result=result, signal_type=signal.signal_type,
+                swept_level=signal.swept_level,
+                confluence_score=signal.confluence_score,
+                confluence_factors=signal.confluence_factors,
+                session=signal.session, holding_candles=j - signal.entry_index,
+                max_favorable_pips=round(max_favorable / pip_size, 1),
+                max_adverse_pips=round(max_adverse / pip_size, 1),
+            )
+        elif signal.direction == "short" and candle_open > current_sl:
+            pnl = ((entry_price - candle_open) / pip_size) * effective_pnl_multiplier
+            if partial_closed:
+                partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
+                pnl += partial_pnl
+            pnl -= total_cost_pips
+            result = "win" if pnl > 0 else ("breakeven" if pnl == 0 else "loss")
+            return Trade(
+                entry_datetime=signal.entry_datetime, exit_datetime=df.index[j],
+                direction="short", entry_price=signal.entry_price,
+                exit_price=candle_open, stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit, pnl_pips=round(pnl, 1),
+                result=result, signal_type=signal.signal_type,
+                swept_level=signal.swept_level,
+                confluence_score=signal.confluence_score,
+                confluence_factors=signal.confluence_factors,
+                session=signal.session, holding_candles=j - signal.entry_index,
+                max_favorable_pips=round(max_favorable / pip_size, 1),
+                max_adverse_pips=round(max_adverse / pip_size, 1),
+            )
 
         if signal.direction == "long":
             favorable = candle_high - entry_price
@@ -328,9 +377,9 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
             max_favorable = max(max_favorable, favorable)
             max_adverse = max(max_adverse, adverse)
 
-            # Break-even logic
+            # Break-even logic (2 pip buffer above entry for noise)
             if break_even_rr > 0 and favorable >= initial_risk * break_even_rr:
-                current_sl = max(current_sl, entry_price + pip_size)
+                current_sl = max(current_sl, entry_price + 2 * pip_size)
 
             # Trailing stop logic
             if trailing_sl and favorable >= initial_risk * trailing_activation_rr:
@@ -349,7 +398,6 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
             # When both SL and TP hit same candle, resolve by distance
             # from open: the closer level is assumed to be hit first
             if sl_hit and tp_hit:
-                candle_open = df["Open"].values[j] if "Open" in df.columns else entry_price
                 sl_hit = abs(candle_open - current_sl) <= abs(candle_open - tp)
                 tp_hit = not sl_hit
 
@@ -358,7 +406,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                     pnl += partial_pnl
-                pnl -= spread_pips
+                pnl -= total_cost_pips
                 result = "win" if pnl > 0 else ("breakeven" if pnl == 0 else "loss")
                 return Trade(
                     entry_datetime=signal.entry_datetime,
@@ -382,7 +430,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                     pnl += partial_pnl
-                pnl -= spread_pips
+                pnl -= total_cost_pips
                 return Trade(
                     entry_datetime=signal.entry_datetime,
                     exit_datetime=df.index[j],
@@ -406,9 +454,9 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
             max_favorable = max(max_favorable, favorable)
             max_adverse = max(max_adverse, adverse)
 
-            # Break-even
+            # Break-even (2 pip buffer below entry for noise)
             if break_even_rr > 0 and favorable >= initial_risk * break_even_rr:
-                current_sl = min(current_sl, entry_price - pip_size)
+                current_sl = min(current_sl, entry_price - 2 * pip_size)
 
             # Trailing stop
             if trailing_sl and favorable >= initial_risk * trailing_activation_rr:
@@ -426,7 +474,6 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
 
             # When both SL and TP hit same candle, resolve by distance from open
             if sl_hit and tp_hit:
-                candle_open = df["Open"].values[j] if "Open" in df.columns else entry_price
                 sl_hit = abs(candle_open - current_sl) <= abs(candle_open - tp)
                 tp_hit = not sl_hit
 
@@ -435,7 +482,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                     pnl += partial_pnl
-                pnl -= spread_pips
+                pnl -= total_cost_pips
                 result = "win" if pnl > 0 else ("breakeven" if pnl == 0 else "loss")
                 return Trade(
                     entry_datetime=signal.entry_datetime,
@@ -459,7 +506,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                     pnl += partial_pnl
-                pnl -= spread_pips
+                pnl -= total_cost_pips
                 return Trade(
                     entry_datetime=signal.entry_datetime,
                     exit_datetime=df.index[j],
@@ -586,6 +633,7 @@ def run_backtest(
     # Pre-extract arrays for simulate_trade performance
     _high_arr = df["High"].values
     _low_arr = df["Low"].values
+    _open_arr = df["Open"].values
 
     # Filter: one trade at a time, max per day, consecutive loss protection
     trades = []
@@ -616,6 +664,7 @@ def run_backtest(
         trade = simulate_trade(
             sig, df, pip_size,
             spread_pips=spread_pips,
+            slippage_pips=0.3,
             trailing_sl=trailing_sl,
             trailing_activation_rr=trailing_activation_rr,
             break_even_rr=break_even_rr,
@@ -623,6 +672,7 @@ def run_backtest(
             partial_tp_pct=partial_tp_pct,
             _high_arr=_high_arr,
             _low_arr=_low_arr,
+            _open_arr=_open_arr,
         )
 
         if trade:

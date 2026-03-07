@@ -8,6 +8,7 @@ from engine.discovery import (
     is_discovery_running, get_discovery_state, load_edges,
     start_discovery_background, stop_discovery_background,
     get_discovery_health, auto_start_discovery,
+    compute_edge_confidence, get_edge_age_days, is_edge_stale,
     EDGE_THRESHOLDS,
 )
 from data.loader import get_cache_stats
@@ -206,13 +207,20 @@ def _progress_banner(state, running):
 
 
 def _render_edge_table(edges):
-    """Render a compact edge table."""
+    """Render a compact edge table with confidence grades and age."""
     import pandas as pd
     rows = []
     for i, e in enumerate(edges):
         validated = getattr(e, "validated", False)
+        grade = getattr(e, "confidence_grade", None) or compute_edge_confidence(e)
+        age = get_edge_age_days(e)
+        age_str = f"{age}d" if age >= 0 else "-"
+        mc_p = getattr(e, "mc_pvalue", None)
+        mc_str = f"{mc_p:.3f}" if mc_p is not None and mc_p < 1.0 else "-"
+        stale = is_edge_stale(e)
         rows.append({
             "#": i + 1,
+            "Grade": grade,
             "Pair": e.pair,
             "TF": e.interval,
             "Strategy": e.strategy.replace("_", " ").title(),
@@ -222,8 +230,10 @@ def _render_edge_table(edges):
             "Expect": f"{e.expectancy_pips:+.1f}p",
             "Sharpe": f"{e.sharpe_ratio:.2f}",
             "Score": f"{e.score:.0f}",
+            "MC p": mc_str,
             "OOS WR": f"{e.oos_win_rate:.0f}%" if validated else "-",
             "OOS PF": f"{e.oos_profit_factor:.2f}" if validated else "-",
-            "Valid": "Yes" if validated else "-",
+            "Age": age_str,
+            "Status": "STALE" if stale else ("Valid" if validated else "-"),
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)

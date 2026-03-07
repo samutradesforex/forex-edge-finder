@@ -11,7 +11,7 @@ from ui.components import (
     pnl_distribution_chart,
 )
 from ui.theme import GREEN, RED, GOLD, BLUE, CYAN, CHART_LAYOUT, CHART_LEGEND_H
-from engine.discovery import load_edges
+from engine.discovery import load_edges, compute_edge_confidence, get_edge_age_days
 from engine.backtester import run_backtest
 from data.loader import fetch_max_data
 
@@ -60,6 +60,28 @@ def render():
     </div>
     """, unsafe_allow_html=True)
 
+    # ── Confidence and age ──
+    grade = getattr(edge, "confidence_grade", None) or compute_edge_confidence(edge)
+    age = get_edge_age_days(edge)
+    mc_p = getattr(edge, "mc_pvalue", None)
+
+    grade_colors = {"A": "#3fb950", "B": "#58a6ff", "C": "#ffd700", "D": "#f85149"}
+    grade_color = grade_colors.get(grade, "#8b949e")
+
+    st.markdown(f"""
+    <div style="display:flex; gap:16px; margin-bottom:12px;">
+        <div style="padding:4px 12px; border-radius:6px; background:{grade_color}22;
+             border:1px solid {grade_color}; color:{grade_color}; font-weight:700;">
+            Grade {grade}
+        </div>
+        <span style="color:#8b949e;">Age: {age}d</span>
+        <span style="color:#8b949e;">MC p-value: {f'{mc_p:.3f}' if mc_p is not None and mc_p < 1.0 else 'N/A'}</span>
+        <span style="color:#8b949e;">
+            {'Statistically significant' if mc_p is not None and mc_p < 0.05 else 'Not significant' if mc_p is not None and mc_p < 1.0 else ''}
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+
     # ── In-sample vs Out-of-sample comparison ──
     section("Performance Summary")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -71,7 +93,9 @@ def render():
     c6.metric("Max DD", f"{edge.max_drawdown_pips:.1f}p")
 
     if is_validated:
-        section("Walk-Forward Validation (Out-of-Sample)")
+        folds_p = getattr(edge, 'oos_folds_passed', 1)
+        folds_t = getattr(edge, 'oos_folds_total', 1)
+        section(f"Walk-Forward Validation ({folds_p}/{folds_t} folds passed)")
         o1, o2, o3, o4, o5 = st.columns(5)
         o1.metric("OOS Trades", edge.oos_total_trades)
         o2.metric("OOS Win Rate", f"{edge.oos_win_rate:.1f}%",

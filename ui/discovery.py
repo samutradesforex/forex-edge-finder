@@ -10,6 +10,7 @@ from engine.discovery import (
     is_discovery_running, get_discovery_state,
     load_edges, save_edges, DiscoveryState,
     ALL_STRATEGIES, ALL_INTERVALS, PARAM_GRID, EDGE_THRESHOLDS,
+    compute_edge_confidence, get_edge_age_days,
 )
 from engine.strategies import registry as strategy_registry
 from data.loader import FOREX_PAIRS
@@ -30,13 +31,13 @@ def render():
     with config_col:
         st.markdown("**Configuration**")
         disc_min_trades = st.number_input(
-            "Min trades", value=10, min_value=3, key="disc_min_tr")
+            "Min trades", value=20, min_value=5, key="disc_min_tr")
         disc_min_pf = st.number_input(
-            "Min profit factor", value=1.2, step=0.1, key="disc_min_pf")
+            "Min profit factor", value=1.3, step=0.1, key="disc_min_pf")
         disc_min_wr = st.number_input(
-            "Min win rate %", value=40.0, step=5.0, key="disc_min_wr")
+            "Min win rate %", value=45.0, step=5.0, key="disc_min_wr")
         disc_min_sharpe = st.number_input(
-            "Min Sharpe", value=0.3, step=0.1, key="disc_min_sharpe")
+            "Min Sharpe", value=0.5, step=0.1, key="disc_min_sharpe")
 
         with st.expander("Advanced", expanded=False):
             disc_pairs = st.multiselect(
@@ -162,8 +163,12 @@ def render():
     for i, e in enumerate(filtered[:100]):
         is_v = getattr(e, "validated", False)
         param_str = ", ".join(f"{k}={v}" for k, v in e.params.items())
+        grade = getattr(e, "confidence_grade", None) or compute_edge_confidence(e)
+        age = get_edge_age_days(e)
+        mc_p = getattr(e, "mc_pvalue", None)
         rows.append({
             "#": i + 1,
+            "Grade": grade,
             "Pair": e.pair,
             "TF": e.interval,
             "Strategy": e.strategy.replace("_", " ").title(),
@@ -175,9 +180,10 @@ def render():
             "Sharpe": f"{e.sharpe_ratio:.2f}",
             "Max DD": f"{e.max_drawdown_pips:.1f}",
             "Score": f"{e.score:.1f}",
+            "MC p": f"{mc_p:.3f}" if mc_p is not None and mc_p < 1.0 else "-",
             "OOS WR": f"{e.oos_win_rate:.0f}%" if is_v else "-",
             "OOS PF": f"{e.oos_profit_factor:.2f}" if is_v else "-",
-            "Valid": "Yes" if is_v else "-",
+            "Age": f"{age}d" if age >= 0 else "-",
             "Params": param_str,
         })
 

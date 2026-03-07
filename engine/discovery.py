@@ -95,16 +95,21 @@ STRATEGY_PARAMS = {
 
 # Minimum thresholds for a strategy to be considered an "edge"
 EDGE_THRESHOLDS = {
-    "min_trades": 10,
-    "min_win_rate": 40.0,
-    "min_profit_factor": 1.2,
-    "min_expectancy_pips": 1.0,
-    "min_sharpe": 0.3,
+    "min_trades": 20,
+    "min_win_rate": 45.0,
+    "min_profit_factor": 1.3,
+    "min_expectancy_pips": 2.0,
+    "min_sharpe": 0.5,
+    "max_drawdown_pct": 80.0,  # Reject edges with extreme drawdown
 }
 
 # Walk-forward validation settings
 WALK_FORWARD_SPLIT = 0.7  # 70% in-sample, 30% out-of-sample
-WALK_FORWARD_DECAY = 0.5  # OOS must retain at least 50% of in-sample performance
+WALK_FORWARD_DECAY = 0.7  # OOS must retain at least 70% of in-sample performance
+
+# Edge lifecycle
+EDGE_MAX_AGE_DAYS = 90  # Edges older than this are marked stale
+MONTE_CARLO_RUNS = 100  # Permutation test iterations
 
 
 @dataclass
@@ -130,7 +135,11 @@ class DiscoveredEdge:
     oos_expectancy_pips: float = 0.0
     oos_total_trades: int = 0
     oos_sharpe_ratio: float = 0.0
+    oos_folds_passed: int = 0
+    oos_folds_total: int = 0
     validated: bool = False
+    mc_pvalue: float = 1.0  # Monte Carlo p-value (lower = more significant)
+    confidence_grade: str = "D"  # A/B/C/D confidence grade
 
     def to_dict(self):
         return asdict(self)
@@ -199,6 +208,14 @@ def save_edges(edges: List[DiscoveredEdge], filename: str = "edges.json"):
         if key not in seen:
             seen.add(key)
             unique.append(e)
+    # Remove stale edges (older than EDGE_MAX_AGE_DAYS)
+    before_stale = len(unique)
+    unique = [e for e in unique if not is_edge_stale(e)]
+    stale_removed = before_stale - len(unique)
+    if stale_removed:
+        logger.info("Removed %d stale edges (older than %d days)",
+                     stale_removed, EDGE_MAX_AGE_DAYS)
+
     # Retention policy: keep top MAX_EDGES by score to prevent unbounded growth
     if len(unique) > MAX_EDGES:
         unique.sort(key=lambda e: e.score, reverse=True)
@@ -287,11 +304,19 @@ def qualifies_as_edge(bt: BacktestResult, thresholds: dict = None) -> bool:
         return False
     if bt.sharpe_ratio < t["min_sharpe"]:
         return False
+    # Reject edges with extreme drawdown relative to profits
+    max_dd_pct = t.get("max_drawdown_pct", 80.0)
+    if bt.max_drawdown_pct > max_dd_pct:
+        return False
     return True
 
 
 def compute_edge_score(bt: BacktestResult) -> float:
-    """Compute a composite score for ranking discovered edges."""
+    """Compute a composite score for ranking discovered edges.
+
+    Factors: expectancy, profit factor, Sharpe, win rate, recovery factor,
+    drawdown penalty, and sample size bonus.
+    """
     pf = min(bt.profit_factor, 5.0) if bt.profit_factor != float("inf") else 5.0
     rf = 0.0
     if bt.max_drawdown_pips > 0:
@@ -303,53 +328,46 @@ def compute_edge_score(bt: BacktestResult) -> float:
     norm_wr = bt.win_rate
     norm_rf = rf * 5
 
+    # Drawdown penalty: penalize edges with >50% drawdown
+    dd_penalty = 1.0
+    if bt.max_drawdown_pct > 50:
+        dd_penalty = max(0.5, 1.0 - (bt.max_drawdown_pct - 50) / 100)
+
+    # Sample size bonus: more trades = more confidence (log scale)
+    # 20 trades = 1.0x, 50 trades = 1.13x, 100 trades = 1.23x
+    import math
+    sample_bonus = min(1.3, math.log(max(bt.total_trades, 1)) / math.log(20))
+
     score = (
-        norm_exp * 0.25 +
-        norm_pf * 0.25 +
+        norm_exp * 0.20 +
+        norm_pf * 0.20 +
         norm_sharpe * 0.20 +
         norm_wr * 0.15 +
-        norm_rf * 0.15
-    )
+        norm_rf * 0.15 +
+        (100 - bt.max_drawdown_pct) * 0.10  # Low drawdown bonus
+    ) * dd_penalty * sample_bonus
     return round(score, 2)
 
 
 # ── Walk-forward validation ──────────────────────────────────────────────
 
-def walk_forward_validate(
-    df: pd.DataFrame, pair: str, strategy: str, interval: str,
-    params: dict, precomputed_is: dict = None,
-    split: float = WALK_FORWARD_SPLIT,
-    decay: float = WALK_FORWARD_DECAY,
-    thresholds: dict = None,
-) -> Optional[Dict]:
-    """Run walk-forward validation: train on first portion, test on rest.
-
-    Returns dict with OOS metrics if validated, None if failed.
-    """
-    n = len(df)
-    split_idx = int(n * split)
-
-    if split_idx < 50 or (n - split_idx) < 30:
-        return None
-
-    # Out-of-sample data — include a lookback window before the split point
-    # so that EMA/RSI/ATR have proper warm-up data
-    indicator_warmup = 60  # candles of lookback for indicator calculation
-    warmup_start = max(0, split_idx - indicator_warmup)
-    df_oos_with_warmup = df.iloc[warmup_start:].copy()
-    df_oos = df.iloc[split_idx:].copy()
-    if len(df_oos) < 30:
-        return None
-
+def _run_oos_backtest(df: pd.DataFrame, df_oos: pd.DataFrame,
+                      pair: str, strategy: str, interval: str,
+                      params: dict, indicator_warmup: int = 60,
+                      ) -> Optional[BacktestResult]:
+    """Run a single OOS backtest with proper indicator warm-up."""
     try:
-        # Compute indicators on data WITH warm-up, then slice to OOS portion
         pip_size = get_pip_size(pair)
-        atr_full = calc_atr(df_oos_with_warmup)
-        rsi_full = calc_rsi(df_oos_with_warmup)
-        ema_fast_full = calc_ema(df_oos_with_warmup["Close"], 21)
-        ema_slow_full = calc_ema(df_oos_with_warmup["Close"], 50)
+        # Find warmup start in the full df
+        oos_start_loc = df.index.get_loc(df_oos.index[0])
+        warmup_start = max(0, oos_start_loc - indicator_warmup)
+        df_warmup = df.iloc[warmup_start:oos_start_loc + len(df_oos)].copy()
 
-        # Slice indicators to match the OOS DataFrame index
+        atr_full = calc_atr(df_warmup)
+        rsi_full = calc_rsi(df_warmup)
+        ema_fast_full = calc_ema(df_warmup["Close"], 21)
+        ema_slow_full = calc_ema(df_warmup["Close"], 50)
+
         oos_precomputed = {
             "atr": atr_full.loc[df_oos.index],
             "rsi": rsi_full.loc[df_oos.index],
@@ -359,38 +377,208 @@ def walk_forward_validate(
             "obs": find_order_blocks(df_oos, pip_size=pip_size),
         }
 
-        bt_oos = run_backtest(
+        return run_backtest(
             df_oos, pair, strategy=strategy, interval=interval,
             _precomputed=oos_precomputed, **params,
         )
+    except Exception:
+        return None
 
-        if bt_oos.total_trades < 5:
-            return None
 
-        # Check OOS performance meets minimum thresholds
-        t = thresholds or EDGE_THRESHOLDS
+def walk_forward_validate(
+    df: pd.DataFrame, pair: str, strategy: str, interval: str,
+    params: dict, precomputed_is: dict = None,
+    split: float = WALK_FORWARD_SPLIT,
+    decay: float = WALK_FORWARD_DECAY,
+    thresholds: dict = None,
+    n_folds: int = 3,
+) -> Optional[Dict]:
+    """Run rolling walk-forward validation with multiple folds.
+
+    Uses n_folds rolling windows instead of a single train/test split.
+    Each fold trains on 70% and tests on the next 30%.
+    An edge must pass ALL folds to be validated.
+
+    Returns dict with averaged OOS metrics if validated, None if failed.
+    """
+    n = len(df)
+    min_oos_candles = 100  # Require meaningful OOS period
+
+    # Fall back to single-fold for smaller datasets
+    if n < 300:
+        n_folds = 1
+        min_oos_candles = 50
+
+    t = thresholds or EDGE_THRESHOLDS
+
+    # Generate rolling fold boundaries
+    fold_size = n // (n_folds + 1)  # Each fold gets ~1/(n_folds+1) of data
+    folds_passed = 0
+    oos_results = []
+
+    for fold in range(n_folds):
+        # Sliding window: train on [start..split], test on [split..end]
+        if n_folds == 1:
+            split_idx = int(n * split)
+            oos_start = split_idx
+            oos_end = n
+        else:
+            # Rolling windows with overlap
+            train_start = fold * fold_size
+            split_idx = train_start + int((n - train_start) * split)
+            oos_start = split_idx
+            oos_end = min(n, split_idx + fold_size + int(fold_size * 0.3))
+            if fold == n_folds - 1:
+                oos_end = n  # Last fold uses all remaining data
+
+        if split_idx < 50 or (oos_end - oos_start) < min_oos_candles:
+            continue
+
+        df_oos = df.iloc[oos_start:oos_end].copy()
+        if len(df_oos) < min_oos_candles:
+            continue
+
+        bt_oos = _run_oos_backtest(df, df_oos, pair, strategy, interval, params)
+        if bt_oos is None or bt_oos.total_trades < 5:
+            continue
+
+        # Check OOS performance with stricter decay
         oos_ok = (
             bt_oos.win_rate >= t["min_win_rate"] * decay and
-            bt_oos.profit_factor >= max(t["min_profit_factor"] * decay, 1.0) and
-            bt_oos.expectancy_pips > 0
+            bt_oos.profit_factor >= max(t["min_profit_factor"] * decay, 1.05) and
+            bt_oos.expectancy_pips > 0 and
+            bt_oos.sharpe_ratio > 0
         )
 
-        if not oos_ok:
-            return None
+        if oos_ok:
+            folds_passed += 1
+            oos_results.append(bt_oos)
 
-        return {
-            "oos_win_rate": round(bt_oos.win_rate, 1),
-            "oos_profit_factor": round(min(bt_oos.profit_factor, 99.9), 2),
-            "oos_expectancy_pips": round(bt_oos.expectancy_pips, 1),
-            "oos_total_trades": bt_oos.total_trades,
-            "oos_sharpe_ratio": round(_clamp_float(bt_oos.sharpe_ratio, -10, 99.9), 2),
-            "validated": True,
-        }
-
-    except Exception as e:
-        logger.warning("Walk-forward validation error for %s %s %s: %s",
-                       pair, strategy, interval, e)
+    # Must pass majority of folds (all for small n_folds)
+    min_folds_required = max(1, n_folds if n_folds <= 2 else n_folds - 1)
+    if folds_passed < min_folds_required or not oos_results:
         return None
+
+    # Average OOS metrics across all passing folds
+    avg_wr = np.mean([r.win_rate for r in oos_results])
+    avg_pf = np.mean([min(r.profit_factor, 99.9) for r in oos_results])
+    avg_exp = np.mean([r.expectancy_pips for r in oos_results])
+    total_trades = sum(r.total_trades for r in oos_results)
+    avg_sharpe = np.mean([_clamp_float(r.sharpe_ratio, -10, 99.9) for r in oos_results])
+
+    return {
+        "oos_win_rate": round(avg_wr, 1),
+        "oos_profit_factor": round(min(avg_pf, 99.9), 2),
+        "oos_expectancy_pips": round(avg_exp, 1),
+        "oos_total_trades": total_trades,
+        "oos_sharpe_ratio": round(avg_sharpe, 2),
+        "oos_folds_passed": folds_passed,
+        "oos_folds_total": n_folds,
+        "validated": True,
+    }
+
+
+# ── Monte Carlo permutation test ──────────────────────────────────────────
+
+def monte_carlo_test(trades_pnl: List[float], observed_expectancy: float,
+                     n_runs: int = None) -> float:
+    """Run Monte Carlo permutation test to check if edge is statistically significant.
+
+    Shuffles trade P&Ls n_runs times, computes expectancy for each shuffle,
+    and returns the p-value (fraction of random shuffles that beat observed).
+    Lower p-value = more confident the edge is real, not luck.
+
+    Returns p-value (0.0 to 1.0). Values < 0.05 are statistically significant.
+    """
+    if n_runs is None:
+        n_runs = MONTE_CARLO_RUNS
+    if len(trades_pnl) < 10:
+        return 1.0  # Not enough data
+
+    rng = np.random.default_rng(42)  # Reproducible
+    pnl_arr = np.array(trades_pnl)
+    n_trades = len(pnl_arr)
+
+    # Count how many random orderings produce equal or better expectancy
+    beat_count = 0
+    for _ in range(n_runs):
+        # Randomly assign win/loss labels by shuffling the P&L values
+        shuffled = rng.choice(pnl_arr, size=n_trades, replace=True)
+        if np.mean(shuffled) >= observed_expectancy:
+            beat_count += 1
+
+    return beat_count / n_runs
+
+
+# ── Edge lifecycle ────────────────────────────────────────────────────────
+
+def compute_edge_confidence(edge) -> str:
+    """Compute a confidence grade for an edge based on validation strength.
+
+    Returns: 'A' (highest), 'B', 'C', or 'D' (lowest).
+    """
+    score = 0
+
+    # Validation status
+    if getattr(edge, 'validated', False):
+        score += 2
+        # Multi-fold validation bonus
+        folds_passed = getattr(edge, 'oos_folds_passed', 1)
+        folds_total = getattr(edge, 'oos_folds_total', 1)
+        if folds_passed >= folds_total:
+            score += 1  # Passed all folds
+
+    # OOS performance quality
+    if getattr(edge, 'oos_profit_factor', 0) >= 1.5:
+        score += 1
+    if getattr(edge, 'oos_win_rate', 0) >= 50:
+        score += 1
+
+    # Monte Carlo significance
+    mc_pvalue = getattr(edge, 'mc_pvalue', 1.0)
+    if mc_pvalue < 0.05:
+        score += 2
+    elif mc_pvalue < 0.10:
+        score += 1
+
+    # Sample size
+    if edge.total_trades >= 50:
+        score += 1
+    elif edge.total_trades >= 30:
+        score += 0.5
+
+    if score >= 6:
+        return 'A'
+    elif score >= 4:
+        return 'B'
+    elif score >= 2:
+        return 'C'
+    return 'D'
+
+
+def is_edge_stale(edge, max_age_days: int = None) -> bool:
+    """Check if an edge is stale (too old to be reliable)."""
+    if max_age_days is None:
+        max_age_days = EDGE_MAX_AGE_DAYS
+    if not edge.discovered_at:
+        return False
+    try:
+        discovered = datetime.fromisoformat(edge.discovered_at)
+        age_days = (datetime.now() - discovered).days
+        return age_days > max_age_days
+    except (ValueError, TypeError):
+        return False
+
+
+def get_edge_age_days(edge) -> int:
+    """Get edge age in days. Returns -1 if unknown."""
+    if not edge.discovered_at:
+        return -1
+    try:
+        discovered = datetime.fromisoformat(edge.discovered_at)
+        return (datetime.now() - discovered).days
+    except (ValueError, TypeError):
+        return -1
 
 
 # ── Smart param grid ─────────────────────────────────────────────────────
@@ -430,6 +618,31 @@ def _count_total_combos(strategies: List[str], intervals: List[str],
         combos = _get_strategy_combos(strat, param_grid)
         total += len(combos) * len(intervals) * len(pairs)
     return total
+
+
+# ── Market hours filtering ─────────────────────────────────────────────────
+
+# Low-liquidity hours to exclude (UTC). These typically have wider spreads
+# and unreliable price action.
+LOW_LIQUIDITY_HOURS_UTC = {21, 22, 23, 0}  # Late NY to early Sydney
+
+
+def filter_market_hours(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """Remove low-liquidity hours from intraday data.
+
+    Only applies to 1h and 4h data. Daily data is unaffected.
+    Filters out late NY / early Sydney sessions (21:00-00:59 UTC)
+    where spreads widen and price action is unreliable.
+    """
+    if interval not in ("1h", "4h"):
+        return df
+    if not hasattr(df.index, 'hour'):
+        return df
+    mask = ~df.index.hour.isin(LOW_LIQUIDITY_HOURS_UTC)
+    filtered = df[mask]
+    if len(filtered) < 50:
+        return df  # Don't filter if it would leave too little data
+    return filtered
 
 
 # ── Core discovery loop ───────────────────────────────────────────────────
@@ -592,6 +805,9 @@ def run_discovery(
                     found_resume_point = True  # resume point pair/intv matched but no data
                 continue
 
+            # Filter out low-liquidity hours for cleaner signals
+            df = filter_market_hours(df, intv)
+
             # For walk-forward: split data
             split_idx = int(len(df) * WALK_FORWARD_SPLIT)
             df_is = df.iloc[:split_idx].copy() if validate and split_idx >= 50 else df
@@ -649,8 +865,16 @@ def run_discovery(
                                 period=period,
                             )
 
-                            # Walk-forward validation
-                            if validate and len(df) > len(df_is) + 30:
+                            # Monte Carlo significance test
+                            trade_pnls = [t.pnl_pips for t in bt.trades]
+                            mc_pval = monte_carlo_test(
+                                trade_pnls, bt.expectancy_pips,
+                                n_runs=MONTE_CARLO_RUNS,
+                            )
+                            edge.mc_pvalue = round(mc_pval, 4)
+
+                            # Walk-forward validation (rolling multi-fold)
+                            if validate and len(df) > len(df_is) + 50:
                                 oos_result = walk_forward_validate(
                                     df, pair, strat, intv, params,
                                     thresholds=thresholds,
@@ -661,15 +885,23 @@ def run_discovery(
                                     edge.oos_expectancy_pips = oos_result["oos_expectancy_pips"]
                                     edge.oos_total_trades = oos_result["oos_total_trades"]
                                     edge.oos_sharpe_ratio = oos_result["oos_sharpe_ratio"]
+                                    edge.oos_folds_passed = oos_result.get("oos_folds_passed", 1)
+                                    edge.oos_folds_total = oos_result.get("oos_folds_total", 1)
                                     edge.validated = True
                                     state.edges_validated += 1
                                     logger.info(
                                         "VALIDATED edge: %s %s %s WR=%.1f%% PF=%.2f "
-                                        "OOS_WR=%.1f%% OOS_PF=%.2f",
+                                        "OOS_WR=%.1f%% OOS_PF=%.2f MC_p=%.3f "
+                                        "folds=%d/%d",
                                         pair, intv, strat, edge.win_rate,
                                         edge.profit_factor, edge.oos_win_rate,
-                                        edge.oos_profit_factor,
+                                        edge.oos_profit_factor, mc_pval,
+                                        edge.oos_folds_passed,
+                                        edge.oos_folds_total,
                                     )
+
+                            # Compute confidence grade
+                            edge.confidence_grade = compute_edge_confidence(edge)
 
                             state.edges.append(edge)
                             state.edges_found += 1
