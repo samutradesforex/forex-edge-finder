@@ -13,6 +13,7 @@ from engine.discovery import (
     PARAM_GRID, ALL_STRATEGIES, ALL_INTERVALS, STRATEGY_PARAMS,
 )
 from engine.backtester import BacktestResult, Trade
+from datetime import datetime
 
 
 class TestEdgeQualification:
@@ -137,6 +138,7 @@ class TestPersistence:
                 total_trades=50, win_rate=55.0, total_pips=100.0,
                 profit_factor=1.8, expectancy_pips=2.0, sharpe_ratio=1.5,
                 max_drawdown_pips=30.0, score=35.0,
+                discovered_at=datetime.now().isoformat(),
             ),
         ]
         save_edges(edges, "test_edges.json")
@@ -154,6 +156,7 @@ class TestPersistence:
             params={"rr_ratio": 2.0}, total_trades=50, win_rate=55.0,
             total_pips=100.0, profit_factor=1.8, expectancy_pips=2.0,
             sharpe_ratio=1.5, max_drawdown_pips=30.0, score=35.0,
+            discovered_at=datetime.now().isoformat(),
         )
         # Save duplicates
         save_edges([edge, edge, edge], "test_edges.json")

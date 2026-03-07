@@ -376,8 +376,13 @@ def _run_oos_backtest(df: pd.DataFrame, df_oos: pd.DataFrame,
     """Run a single OOS backtest with proper indicator warm-up."""
     try:
         pip_size = get_pip_size(pair)
-        # Find warmup start in the full df
+        # Find warmup start in the full df (handle duplicate indices)
         oos_start_loc = df.index.get_loc(df_oos.index[0])
+        if isinstance(oos_start_loc, slice):
+            oos_start_loc = oos_start_loc.start or 0
+        elif hasattr(oos_start_loc, '__len__'):
+            import numpy as np
+            oos_start_loc = int(np.where(oos_start_loc)[0][0])
         warmup_start = max(0, oos_start_loc - indicator_warmup)
         df_warmup = df.iloc[warmup_start:oos_start_loc + len(df_oos)].copy()
 
@@ -591,7 +596,7 @@ def is_edge_stale(edge, max_age_days: int = None) -> bool:
     if max_age_days is None:
         max_age_days = EDGE_MAX_AGE_DAYS
     if not edge.discovered_at:
-        return False
+        return True  # Undated edges are treated as stale
     try:
         discovered = datetime.fromisoformat(edge.discovered_at)
         age_days = (datetime.now() - discovered).days
@@ -939,9 +944,8 @@ def run_discovery(
                             state.edges_found += 1
                             existing_keys.add(key)
 
-                            # Save incrementally every 10 edges
-                            if state.edges_found % 10 == 0:
-                                save_edges(state.edges)
+                            # Save after every edge to prevent loss on crash
+                            save_edges(state.edges)
 
                     except Exception as e:
                         _bt_error_count = getattr(state, '_bt_error_count', 0) + 1
