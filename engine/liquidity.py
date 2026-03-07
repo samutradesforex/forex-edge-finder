@@ -920,6 +920,7 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
                 conf_factors.remove("trend_aligned")
                 conf_score -= 1
             conf_factors.insert(0, "ema_crossover")
+            conf_score += 1
 
             if conf_score < min_confluence:
                 continue
@@ -949,6 +950,7 @@ def detect_ema_crossover(df: pd.DataFrame, pip_size: float = 0.0001,
                 conf_factors.remove("trend_aligned")
                 conf_score -= 1
             conf_factors.insert(0, "ema_crossover")
+            conf_score += 1
 
             if conf_score < min_confluence:
                 continue
@@ -1048,6 +1050,7 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
                 conf_factors.remove(rf)
                 conf_score -= 1
             conf_factors.insert(0, "rsi_reversal")
+            conf_score += 1
 
             if conf_score < min_confluence:
                 continue
@@ -1082,6 +1085,7 @@ def detect_rsi_reversal(df: pd.DataFrame, pip_size: float = 0.0001,
                 conf_factors.remove(rf)
                 conf_score -= 1
             conf_factors.insert(0, "rsi_reversal")
+            conf_score += 1
 
             if conf_score < min_confluence:
                 continue
@@ -1178,6 +1182,7 @@ def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
                     df, i, "long", level, atr, fvgs, obs, rsi,
                     ema_fast, ema_slow, pip_size, **conf_kw)
                 conf_factors.insert(0, "breakout")
+                conf_score += 1
 
                 if conf_score < min_confluence:
                     continue
@@ -1211,6 +1216,7 @@ def detect_breakout(df: pd.DataFrame, swings: List[SwingPoint],
                     df, i, "short", level, atr, fvgs, obs, rsi,
                     ema_fast, ema_slow, pip_size, **conf_kw)
                 conf_factors.insert(0, "breakout")
+                conf_score += 1
 
                 if conf_score < min_confluence:
                     continue
@@ -1303,6 +1309,7 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
                         df, i, "long", level, atr, fvgs, obs, rsi,
                         ema_fast, ema_slow, pip_size, **conf_kw)
                     conf_factors.insert(0, "fvg_entry")
+                    conf_score += 1
 
                     if conf_score < min_confluence:
                         continue
@@ -1333,6 +1340,7 @@ def detect_fvg_entry(df: pd.DataFrame, pip_size: float = 0.0001,
                         df, i, "short", level, atr, fvgs, obs, rsi,
                         ema_fast, ema_slow, pip_size, **conf_kw)
                     conf_factors.insert(0, "fvg_entry")
+                    conf_score += 1
 
                     if conf_score < min_confluence:
                         continue
@@ -1430,6 +1438,7 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
                         df, i, "long", level, atr, fvgs, obs, rsi,
                         ema_fast, ema_slow, pip_size, **conf_kw)
                     conf_factors.insert(0, "ob_bounce")
+                    conf_score += 1
 
                     if conf_score < min_confluence:
                         continue
@@ -1461,6 +1470,7 @@ def detect_ob_bounce(df: pd.DataFrame, pip_size: float = 0.0001,
                         df, i, "short", level, atr, fvgs, obs, rsi,
                         ema_fast, ema_slow, pip_size, **conf_kw)
                     conf_factors.insert(0, "ob_bounce")
+                    conf_score += 1
 
                     if conf_score < min_confluence:
                         continue

@@ -38,6 +38,8 @@ def render():
             "Min win rate %", value=45.0, step=5.0, key="disc_min_wr")
         disc_min_sharpe = st.number_input(
             "Min Sharpe", value=0.5, step=0.1, key="disc_min_sharpe")
+        disc_min_rr = st.number_input(
+            "Min RR (payoff)", value=0.8, step=0.1, key="disc_min_rr")
 
         with st.expander("Advanced", expanded=False):
             disc_pairs = st.multiselect(
@@ -72,6 +74,7 @@ def render():
                     "min_profit_factor": disc_min_pf,
                     "min_win_rate": disc_min_wr,
                     "min_sharpe": disc_min_sharpe,
+                    "min_payoff_ratio": disc_min_rr,
                 }
                 if start_discovery_background(
                     pairs=disc_pairs if len(disc_pairs) < len(FOREX_PAIRS) else None,
@@ -166,6 +169,7 @@ def render():
         grade = getattr(e, "confidence_grade", None) or compute_edge_confidence(e)
         age = get_edge_age_days(e)
         mc_p = getattr(e, "mc_pvalue", None)
+        rr = getattr(e, "payoff_ratio", 0)
         rows.append({
             "#": i + 1,
             "Grade": grade,
@@ -174,6 +178,7 @@ def render():
             "Strategy": e.strategy.replace("_", " ").title(),
             "Trades": e.total_trades,
             "Win Rate": f"{e.win_rate:.0f}%",
+            "RR": f"{rr:.2f}" if rr and rr < 99 else "-",
             "Net Pips": f"{e.total_pips:+.1f}",
             "PF": f"{e.profit_factor:.2f}",
             "Expect": f"{e.expectancy_pips:+.1f}",

@@ -62,15 +62,14 @@ class TestEMACrossoverConfluence:
     trend_aligned was counted in score but removed from factor list."""
 
     def test_score_excludes_trend_aligned(self, sample_ohlcv):
-        """Score should NOT include trend_aligned (always true at crossover)."""
+        """Score should NOT include trend_aligned (always true at crossover).
+        Score should equal total factor count (ema_crossover + other real factors)."""
         sigs = detect_ema_crossover(
             sample_ohlcv, pip_size=0.0001, rr_ratio=2.0, min_confluence=0)
         for s in sigs:
-            # Score counts real confluence factors (excluding the ema_crossover label
-            # and the removed trend_aligned). So score == len(factors) - 1.
-            real_factors = [f for f in s.confluence_factors if f != "ema_crossover"]
-            assert s.confluence_score == len(real_factors), \
-                f"Score {s.confluence_score} != real factor count {len(real_factors)}: {s.confluence_factors}"
+            # Score should match the total number of confluence factors
+            assert s.confluence_score == len(s.confluence_factors), \
+                f"Score {s.confluence_score} != factor count {len(s.confluence_factors)}: {s.confluence_factors}"
 
     def test_no_trend_aligned_in_factors(self, sample_ohlcv):
         sigs = detect_ema_crossover(
@@ -102,14 +101,14 @@ class TestRSIReversalConfluence:
                     f"rsi_overbought should be removed for RSI reversal short: {s.confluence_factors}"
 
     def test_score_excludes_rsi_doublecount(self, sample_ohlcv):
-        """Score should NOT double-count the RSI condition."""
+        """Score should NOT double-count the RSI condition.
+        Score should equal total factor count (rsi_reversal + other real factors)."""
         sigs = detect_rsi_reversal(
             sample_ohlcv, pip_size=0.0001, rr_ratio=2.0, min_confluence=0)
         for s in sigs:
-            # Score counts real confluence factors (excluding the rsi_reversal label)
-            real_factors = [f for f in s.confluence_factors if f != "rsi_reversal"]
-            assert s.confluence_score == len(real_factors), \
-                f"Score {s.confluence_score} != real factor count {len(real_factors)}: {s.confluence_factors}"
+            # Score should match the total number of confluence factors
+            assert s.confluence_score == len(s.confluence_factors), \
+                f"Score {s.confluence_score} != factor count {len(s.confluence_factors)}: {s.confluence_factors}"
 
 
 class TestStructureBreakChronological:

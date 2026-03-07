@@ -84,13 +84,15 @@ def render():
 
     # ── In-sample vs Out-of-sample comparison ──
     section("Performance Summary")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Trades", edge.total_trades)
     c2.metric("Win Rate", f"{edge.win_rate:.1f}%")
-    c3.metric("Profit Factor", f"{edge.profit_factor:.2f}")
-    c4.metric("Expectancy", f"{edge.expectancy_pips:+.1f}p")
-    c5.metric("Sharpe", f"{edge.sharpe_ratio:.2f}")
-    c6.metric("Max DD", f"{edge.max_drawdown_pips:.1f}p")
+    rr = getattr(edge, "payoff_ratio", 0)
+    c3.metric("RR (Payoff)", f"{rr:.2f}" if rr and rr < 99 else "---")
+    c4.metric("Profit Factor", f"{edge.profit_factor:.2f}")
+    c5.metric("Expectancy", f"{edge.expectancy_pips:+.1f}p")
+    c6.metric("Sharpe", f"{edge.sharpe_ratio:.2f}")
+    c7.metric("Max DD", f"{edge.max_drawdown_pips:.1f}p")
 
     if is_validated:
         folds_p = getattr(edge, 'oos_folds_passed', 1)

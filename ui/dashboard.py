@@ -218,6 +218,8 @@ def _render_edge_table(edges):
         mc_p = getattr(e, "mc_pvalue", None)
         mc_str = f"{mc_p:.3f}" if mc_p is not None and mc_p < 1.0 else "-"
         stale = is_edge_stale(e)
+        rr = getattr(e, "payoff_ratio", 0)
+        rr_str = f"{rr:.2f}" if rr and rr < 99 else "-"
         rows.append({
             "#": i + 1,
             "Grade": grade,
@@ -226,6 +228,7 @@ def _render_edge_table(edges):
             "Strategy": e.strategy.replace("_", " ").title(),
             "Trades": e.total_trades,
             "Win Rate": f"{e.win_rate:.0f}%",
+            "RR": rr_str,
             "PF": f"{e.profit_factor:.2f}",
             "Expect": f"{e.expectancy_pips:+.1f}p",
             "Sharpe": f"{e.sharpe_ratio:.2f}",

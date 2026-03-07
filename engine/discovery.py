@@ -100,6 +100,7 @@ EDGE_THRESHOLDS = {
     "min_profit_factor": 1.3,
     "min_expectancy_pips": 2.0,
     "min_sharpe": 0.5,
+    "min_payoff_ratio": 0.8,  # Min avg_win/avg_loss (RR)
     "max_drawdown_pct": 80.0,  # Reject edges with extreme drawdown
 }
 
@@ -127,6 +128,8 @@ class DiscoveredEdge:
     sharpe_ratio: float
     max_drawdown_pips: float
     score: float
+    payoff_ratio: float = 0.0  # Risk:Reward (avg win / avg loss)
+    max_drawdown_pct: float = 0.0
     discovered_at: str = ""
     period: str = "6mo"
     # Walk-forward validation fields
@@ -304,6 +307,13 @@ def qualifies_as_edge(bt: BacktestResult, thresholds: dict = None) -> bool:
         return False
     if bt.sharpe_ratio < t["min_sharpe"]:
         return False
+    # Check payoff ratio (RR) — reject edges with terrible reward relative to risk
+    min_rr = t.get("min_payoff_ratio", 0.8)
+    pr = bt.payoff_ratio
+    # Handle inf (no losses = infinite payoff, which is fine)
+    if pr != float("inf") and pr != float("-inf") and pr == pr:  # not NaN
+        if pr < min_rr:
+            return False
     # Reject edges with extreme drawdown relative to profits
     max_dd_pct = t.get("max_drawdown_pct", 80.0)
     if bt.max_drawdown_pct > max_dd_pct:
@@ -322,11 +332,18 @@ def compute_edge_score(bt: BacktestResult) -> float:
     if bt.max_drawdown_pips > 0:
         rf = min(bt.total_pips / bt.max_drawdown_pips, 10.0)
 
+    # Payoff ratio (RR) — cap at 5.0 for normalization, handle inf
+    pr = bt.payoff_ratio
+    if pr != pr or pr == float("inf") or pr == float("-inf"):
+        pr = 5.0 if (bt.avg_win_pips > 0 and bt.avg_loss_pips == 0) else 0.0
+    pr = min(pr, 5.0)
+
     norm_exp = min(max(bt.expectancy_pips, -10), 10) * 5
     norm_pf = pf * 10
     norm_sharpe = min(max(bt.sharpe_ratio, -2), 5) * 10
     norm_wr = bt.win_rate
     norm_rf = rf * 5
+    norm_rr = pr * 10  # RR of 2.0 → 20 points
 
     # Drawdown penalty: penalize edges with >50% drawdown
     dd_penalty = 1.0
@@ -339,12 +356,13 @@ def compute_edge_score(bt: BacktestResult) -> float:
     sample_bonus = min(1.3, math.log(max(bt.total_trades, 1)) / math.log(20))
 
     score = (
-        norm_exp * 0.20 +
-        norm_pf * 0.20 +
-        norm_sharpe * 0.20 +
+        norm_exp * 0.15 +
+        norm_pf * 0.15 +
+        norm_sharpe * 0.15 +
         norm_wr * 0.15 +
-        norm_rf * 0.15 +
-        (100 - bt.max_drawdown_pct) * 0.10  # Low drawdown bonus
+        norm_rf * 0.10 +
+        norm_rr * 0.15 +   # RR contributes 15%
+        (100 - bt.max_drawdown_pct) * 0.15  # Low drawdown bonus
     ) * dd_penalty * sample_bonus
     return round(score, 2)
 
@@ -402,34 +420,33 @@ def walk_forward_validate(
     Returns dict with averaged OOS metrics if validated, None if failed.
     """
     n = len(df)
-    min_oos_candles = 100  # Require meaningful OOS period
+    min_oos_candles = 80  # Require meaningful OOS period
 
     # Fall back to single-fold for smaller datasets
-    if n < 300:
+    if n < 400:
         n_folds = 1
-        min_oos_candles = 50
+        min_oos_candles = 40
 
     t = thresholds or EDGE_THRESHOLDS
 
     # Generate rolling fold boundaries
-    fold_size = n // (n_folds + 1)  # Each fold gets ~1/(n_folds+1) of data
+    # Each fold shifts forward by step_size, with OOS being the last 30% of remaining data
+    step_size = max(1, n // (n_folds * 2))  # Reasonable step between folds
     folds_passed = 0
     oos_results = []
 
     for fold in range(n_folds):
-        # Sliding window: train on [start..split], test on [split..end]
         if n_folds == 1:
             split_idx = int(n * split)
             oos_start = split_idx
             oos_end = n
         else:
-            # Rolling windows with overlap
-            train_start = fold * fold_size
-            split_idx = train_start + int((n - train_start) * split)
+            # Anchored walk-forward: train start advances, OOS is always the trailing portion
+            train_start = fold * step_size
+            remaining = n - train_start
+            split_idx = train_start + int(remaining * split)
             oos_start = split_idx
-            oos_end = min(n, split_idx + fold_size + int(fold_size * 0.3))
-            if fold == n_folds - 1:
-                oos_end = n  # Last fold uses all remaining data
+            oos_end = n  # Always test through the end for maximum OOS data
 
         if split_idx < 50 or (oos_end - oos_start) < min_oos_candles:
             continue
@@ -484,9 +501,11 @@ def monte_carlo_test(trades_pnl: List[float], observed_expectancy: float,
                      n_runs: int = None) -> float:
     """Run Monte Carlo permutation test to check if edge is statistically significant.
 
-    Shuffles trade P&Ls n_runs times, computes expectancy for each shuffle,
-    and returns the p-value (fraction of random shuffles that beat observed).
-    Lower p-value = more confident the edge is real, not luck.
+    Tests null hypothesis: "the observed expectancy could have arisen by chance."
+    Randomly flips the sign of each trade's P&L n_runs times (simulating a
+    world where the strategy has no directional edge — wins and losses are
+    equally likely). Computes the fraction of random sign-flips that produce
+    an equal or greater mean P&L than observed.
 
     Returns p-value (0.0 to 1.0). Values < 0.05 are statistically significant.
     """
@@ -495,19 +514,23 @@ def monte_carlo_test(trades_pnl: List[float], observed_expectancy: float,
     if len(trades_pnl) < 10:
         return 1.0  # Not enough data
 
-    rng = np.random.default_rng(42)  # Reproducible
     pnl_arr = np.array(trades_pnl)
     n_trades = len(pnl_arr)
 
-    # Count how many random orderings produce equal or better expectancy
-    beat_count = 0
-    for _ in range(n_runs):
-        # Randomly assign win/loss labels by shuffling the P&L values
-        shuffled = rng.choice(pnl_arr, size=n_trades, replace=True)
-        if np.mean(shuffled) >= observed_expectancy:
-            beat_count += 1
+    # Seed from the data for reproducibility without global state
+    seed = int(abs(np.sum(pnl_arr) * 1000 + n_trades * 7)) % (2**31)
+    rng = np.random.default_rng(seed)
 
-    return beat_count / n_runs
+    # Vectorized sign-flip permutation test:
+    # For each run, randomly flip the sign of each trade (+1 or -1)
+    # This simulates a strategy with no directional edge
+    signs = rng.choice([-1, 1], size=(n_runs, n_trades))
+    permuted = pnl_arr * signs  # shape: (n_runs, n_trades)
+    permuted_means = np.mean(permuted, axis=1)
+
+    # p-value: fraction of permutations with mean >= observed
+    beat_count = np.sum(permuted_means >= observed_expectancy)
+    return float(beat_count / n_runs)
 
 
 # ── Edge lifecycle ────────────────────────────────────────────────────────
@@ -545,6 +568,13 @@ def compute_edge_confidence(edge) -> str:
     if edge.total_trades >= 50:
         score += 1
     elif edge.total_trades >= 30:
+        score += 0.5
+
+    # Good RR (payoff ratio)
+    rr = getattr(edge, 'payoff_ratio', 0)
+    if rr and rr >= 1.5:
+        score += 1
+    elif rr and rr >= 1.0:
         score += 0.5
 
     if score >= 6:
@@ -861,6 +891,8 @@ def run_discovery(
                                 sharpe_ratio=round(_clamp_float(bt.sharpe_ratio, -10, 99.9), 2),
                                 max_drawdown_pips=round(bt.max_drawdown_pips, 1),
                                 score=compute_edge_score(bt),
+                                payoff_ratio=round(_clamp_float(bt.payoff_ratio, 0, 99.9), 2),
+                                max_drawdown_pct=round(bt.max_drawdown_pct, 1),
                                 discovered_at=datetime.now().isoformat(),
                                 period=period,
                             )

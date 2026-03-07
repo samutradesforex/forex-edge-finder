@@ -16,7 +16,8 @@ from engine.backtester import BacktestResult, Trade
 
 
 class TestEdgeQualification:
-    def _make_bt(self, trades=25, win_rate=50, pf=1.5, exp=3.0, sharpe=1.0, dd=20):
+    def _make_bt(self, trades=25, win_rate=50, pf=1.5, exp=3.0, sharpe=1.0,
+                 dd=20, payoff=1.5):
         bt = BacktestResult(trades=[])
         bt.total_trades = trades
         bt.win_rate = win_rate
@@ -25,6 +26,7 @@ class TestEdgeQualification:
         bt.sharpe_ratio = sharpe
         bt.max_drawdown_pips = dd
         bt.max_drawdown_pct = 30.0
+        bt.payoff_ratio = payoff
         bt.total_pips = exp * trades
         return bt
 
@@ -50,6 +52,15 @@ class TestEdgeQualification:
 
     def test_low_sharpe(self):
         bt = self._make_bt(sharpe=0.1)
+        assert not qualifies_as_edge(bt)
+
+    def test_low_payoff_ratio(self):
+        bt = self._make_bt(payoff=0.3)
+        assert not qualifies_as_edge(bt)
+
+    def test_high_drawdown_rejected(self):
+        bt = self._make_bt()
+        bt.max_drawdown_pct = 90.0
         assert not qualifies_as_edge(bt)
 
 

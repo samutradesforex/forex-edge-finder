@@ -221,6 +221,8 @@ class BacktestResult:
                 self.sortino_ratio = float("inf")
         if max_dd > 0:
             self.calmar_ratio = self.total_pips / max_dd
+        elif self.total_pips > 0:
+            self.calmar_ratio = float("inf")  # Positive return with zero drawdown
 
         # Average holding time and confluence
         holdings = [t.holding_candles for t in self.trades]
@@ -335,7 +337,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
             if partial_closed:
                 partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                 pnl += partial_pnl
-            pnl -= total_cost_pips
+            pnl -= total_cost_pips * (2 if partial_closed else 1)
             result = "win" if pnl > 0 else ("breakeven" if pnl == 0 else "loss")
             return Trade(
                 entry_datetime=signal.entry_datetime, exit_datetime=df.index[j],
@@ -355,7 +357,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
             if partial_closed:
                 partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                 pnl += partial_pnl
-            pnl -= total_cost_pips
+            pnl -= total_cost_pips * (2 if partial_closed else 1)
             result = "win" if pnl > 0 else ("breakeven" if pnl == 0 else "loss")
             return Trade(
                 entry_datetime=signal.entry_datetime, exit_datetime=df.index[j],
@@ -406,7 +408,8 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                     pnl += partial_pnl
-                pnl -= total_cost_pips
+                # Two fills = two execution costs when partial TP was triggered
+                pnl -= total_cost_pips * (2 if partial_closed else 1)
                 result = "win" if pnl > 0 else ("breakeven" if pnl == 0 else "loss")
                 return Trade(
                     entry_datetime=signal.entry_datetime,
@@ -430,7 +433,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                     pnl += partial_pnl
-                pnl -= total_cost_pips
+                pnl -= total_cost_pips * (2 if partial_closed else 1)
                 return Trade(
                     entry_datetime=signal.entry_datetime,
                     exit_datetime=df.index[j],
@@ -482,7 +485,8 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                     pnl += partial_pnl
-                pnl -= total_cost_pips
+                # Two fills = two execution costs when partial TP was triggered
+                pnl -= total_cost_pips * (2 if partial_closed else 1)
                 result = "win" if pnl > 0 else ("breakeven" if pnl == 0 else "loss")
                 return Trade(
                     entry_datetime=signal.entry_datetime,
@@ -506,7 +510,7 @@ def simulate_trade(signal: InducementSignal, df: pd.DataFrame,
                 if partial_closed:
                     partial_pnl = (initial_risk * partial_tp_rr / pip_size) * partial_tp_pct
                     pnl += partial_pnl
-                pnl -= total_cost_pips
+                pnl -= total_cost_pips * (2 if partial_closed else 1)
                 return Trade(
                     entry_datetime=signal.entry_datetime,
                     exit_datetime=df.index[j],
@@ -679,6 +683,12 @@ def run_backtest(
             trades.append(trade)
             try:
                 exit_idx = df.index.get_loc(trade.exit_datetime)
+                # get_loc may return slice/array for duplicate indices
+                if isinstance(exit_idx, slice):
+                    exit_idx = exit_idx.stop - 1 if exit_idx.stop else 0
+                elif hasattr(exit_idx, '__len__'):
+                    # Boolean array — find last True position
+                    exit_idx = int(np.where(exit_idx)[0][-1])
             except KeyError:
                 exit_idx = df.index.searchsorted(trade.exit_datetime)
             last_exit_idx = exit_idx
