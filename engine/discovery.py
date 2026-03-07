@@ -45,13 +45,20 @@ logger = logging.getLogger(__name__)
 _log_configured = False
 
 def _setup_file_logging():
-    """Configure file logging so discovery runs are traceable even unattended."""
+    """Configure rotating file logging so discovery runs are traceable unattended.
+
+    Uses RotatingFileHandler to prevent discovery.log from growing unboundedly.
+    Max 5 MB per file, keeps 3 backup files (20 MB total max).
+    """
     global _log_configured
     if _log_configured:
         return
     _log_configured = True
+    from logging.handlers import RotatingFileHandler
     log_path = Path("discovery.log")
-    handler = logging.FileHandler(log_path, mode="a")
+    handler = RotatingFileHandler(
+        log_path, maxBytes=5 * 1024 * 1024, backupCount=3, mode="a",
+    )
     handler.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -178,6 +185,9 @@ def _atomic_write(path: Path, content: str):
     tmp.replace(path)  # atomic on POSIX
 
 
+MAX_EDGES = 5000  # Retention limit — prune lowest-scoring edges beyond this
+
+
 def save_edges(edges: List[DiscoveredEdge], filename: str = "edges.json"):
     _ensure_dir()
     path = RESULTS_DIR / filename
@@ -189,6 +199,12 @@ def save_edges(edges: List[DiscoveredEdge], filename: str = "edges.json"):
         if key not in seen:
             seen.add(key)
             unique.append(e)
+    # Retention policy: keep top MAX_EDGES by score to prevent unbounded growth
+    if len(unique) > MAX_EDGES:
+        unique.sort(key=lambda e: e.score, reverse=True)
+        pruned = len(unique) - MAX_EDGES
+        unique = unique[:MAX_EDGES]
+        logger.info("Pruned %d low-scoring edges (retention limit: %d)", pruned, MAX_EDGES)
     data = [e.to_dict() for e in unique]
     with _file_lock:
         _atomic_write(path, json.dumps(data, indent=2, default=str))
@@ -243,6 +259,17 @@ def load_state(filename: str = "state.json") -> DiscoveryState:
     except (json.JSONDecodeError, TypeError, KeyError) as e:
         logger.warning("Failed to load state: %s", e)
         return DiscoveryState()
+
+
+def _clamp_float(v: float, lo: float = -99.9, hi: float = 99.9) -> float:
+    """Clamp a float, converting inf/NaN to safe values for JSON serialization."""
+    if v != v:  # NaN
+        return 0.0
+    if v == float("inf"):
+        return hi
+    if v == float("-inf"):
+        return lo
+    return max(lo, min(hi, v))
 
 
 # ── Edge qualification ─────────────────────────────────────────────────────
@@ -356,7 +383,7 @@ def walk_forward_validate(
             "oos_profit_factor": round(min(bt_oos.profit_factor, 99.9), 2),
             "oos_expectancy_pips": round(bt_oos.expectancy_pips, 1),
             "oos_total_trades": bt_oos.total_trades,
-            "oos_sharpe_ratio": round(bt_oos.sharpe_ratio, 2),
+            "oos_sharpe_ratio": round(_clamp_float(bt_oos.sharpe_ratio, -10, 99.9), 2),
             "validated": True,
         }
 
@@ -517,7 +544,9 @@ def run_discovery(
     # Compute total work with smart filtering
     state.total_combos = _count_total_combos(strategies, intervals, pairs, param_grid)
     state.status = "running"
-    state.edges = load_edges()
+    # Load edges from disk unless caller already populated them (avoids double-load)
+    if not state.edges:
+        state.edges = load_edges()
     t0 = time.time()
 
     existing_keys = {
@@ -613,7 +642,7 @@ def run_discovery(
                                 total_pips=round(bt.total_pips, 1),
                                 profit_factor=round(min(bt.profit_factor, 99.9), 2),
                                 expectancy_pips=round(bt.expectancy_pips, 1),
-                                sharpe_ratio=round(bt.sharpe_ratio, 2),
+                                sharpe_ratio=round(_clamp_float(bt.sharpe_ratio, -10, 99.9), 2),
                                 max_drawdown_pips=round(bt.max_drawdown_pips, 1),
                                 score=compute_edge_score(bt),
                                 discovered_at=datetime.now().isoformat(),
@@ -651,9 +680,21 @@ def run_discovery(
                                 save_edges(state.edges)
 
                     except Exception as e:
-                        logger.debug("Backtest error %s %s %s: %s", pair, strat, intv, e)
+                        _bt_error_count = getattr(state, '_bt_error_count', 0) + 1
+                        state._bt_error_count = _bt_error_count
+                        # Log first 5 errors per strategy at WARNING, rest at DEBUG
+                        if _bt_error_count <= 5:
+                            logger.warning("Backtest error %s %s %s: %s",
+                                           pair, strat, intv, e)
+                        elif _bt_error_count == 6:
+                            logger.warning(
+                                "Suppressing further backtest errors (5+ logged). "
+                                "Check strategy %s for bugs.", strat)
 
                     state.combos_tested += 1
+
+                # Reset per-strategy error count
+                state._bt_error_count = 0
 
                 # Track completion for resume
                 state.last_completed_pair = pair
