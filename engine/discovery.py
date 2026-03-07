@@ -388,8 +388,8 @@ def walk_forward_validate(
         }
 
     except Exception as e:
-        logger.debug("Walk-forward validation error for %s %s %s: %s",
-                     pair, strategy, interval, e)
+        logger.warning("Walk-forward validation error for %s %s %s: %s",
+                       pair, strategy, interval, e)
         return None
 
 

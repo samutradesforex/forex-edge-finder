@@ -575,8 +575,10 @@ def run_backtest(
         kw.update(extra_kw)
         try:
             signals.extend(meta.detect(df, *extra_args, **kw))
-        except Exception:
-            pass  # Skip broken strategies gracefully
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Strategy %s signal detection failed: %s", strat_name, e)
 
     # Sort by time
     signals.sort(key=lambda s: s.entry_index)
