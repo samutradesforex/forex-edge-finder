@@ -206,10 +206,16 @@ def fetch_max_data(pair_name: str, interval: str = "1h",
 
 def _resample_4h(df: pd.DataFrame) -> pd.DataFrame:
     """Resample 1h data to 4h candles."""
+    if df.empty:
+        return df
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
     if "Volume" in df.columns:
         agg["Volume"] = "sum"
-    return df.resample("4h").agg(agg).dropna()
+    result = df.resample("4h").agg(agg).dropna()
+    if result.empty:
+        logger.warning("4h resample produced empty DataFrame from %d rows", len(df))
+        return df  # Fall back to original data
+    return result
 
 
 # ── Data quality ──────────────────────────────────────────────────────────
@@ -253,9 +259,14 @@ def clean_ohlc(df: pd.DataFrame) -> pd.DataFrame:
         # Flag candles with body > 10x ATR (extreme outlier)
         outlier_mask = (body > atr * 10) & (atr > 0)
         n_outliers = outlier_mask.sum()
-        if n_outliers > 0:
+        # Safety cap: never remove more than 5% of candles
+        max_removable = max(1, int(len(df) * 0.05))
+        if 0 < n_outliers <= max_removable:
             logger.warning("Removed %d outlier candles (body > 10x ATR)", n_outliers)
             df = df[~outlier_mask]
+        elif n_outliers > max_removable:
+            logger.warning("Skipped outlier removal: %d outliers exceeds 5%% cap (%d)",
+                          n_outliers, max_removable)
 
     cleaned = original_len - len(df)
     if cleaned > 0:

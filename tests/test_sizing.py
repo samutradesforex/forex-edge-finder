@@ -60,9 +60,10 @@ class TestAccountSimulation:
                                         risk_pct=2.0, compounding=True)
         sim_fixed = simulate_account(bt.trades, sizing_mode="risk_pct",
                                      risk_pct=2.0, compounding=False)
-        # Results should differ (compounding adjusts position size)
-        assert sim_compound.ending_balance != sim_fixed.ending_balance or \
-               sim_compound.largest_position == sim_fixed.largest_position
+        # Compounding should produce different balance or position sizes
+        differs = (sim_compound.ending_balance != sim_fixed.ending_balance or
+                   sim_compound.largest_position != sim_fixed.largest_position)
+        assert differs, "Compounding should produce different results than fixed sizing"
 
     def test_return_pct_calculation(self, sample_ohlcv):
         bt = run_backtest(sample_ohlcv, "EUR/USD", strategy="sweeps")

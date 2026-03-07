@@ -104,14 +104,21 @@ def simulate_account(
             past = trades[:i]
             past_wins = [t for t in past if t.result == "win"]
             past_losses = [t for t in past if t.result == "loss"]
-            if past_wins and past_losses:
-                wr = len(past_wins) / len(past)
-                avg_w = np.mean([t.pnl_pips for t in past_wins])
-                avg_l = abs(np.mean([t.pnl_pips for t in past_losses]))
-                if avg_l > 0:
-                    b = avg_w / avg_l
-                    kelly_fraction = (wr * b - (1 - wr)) / b
-                    kelly_fraction = max(0, min(kelly_fraction, max_risk_pct / 100))
+            n_decided = len(past_wins) + len(past_losses)
+            if past_wins and n_decided > 0:
+                wr = len(past_wins) / n_decided  # Exclude breakevens from denominator
+                if past_losses:
+                    avg_w = np.mean([t.pnl_pips for t in past_wins])
+                    avg_l = abs(np.mean([t.pnl_pips for t in past_losses]))
+                    if avg_l > 0:
+                        b = avg_w / avg_l
+                        kelly_fraction = (wr * b - (1 - wr)) / b
+                    else:
+                        kelly_fraction = max_risk_pct / 100  # No avg loss, cap at max
+                else:
+                    # 100% win rate — Kelly says bet max, cap at max_risk_pct
+                    kelly_fraction = max_risk_pct / 100
+                kelly_fraction = max(0, min(kelly_fraction, max_risk_pct / 100))
 
         # Determine position size
         if sizing_mode == "fixed":
@@ -148,6 +155,10 @@ def simulate_account(
 
         largest_pos = max(largest_pos, lot_size)
         smallest_pos = min(smallest_pos, lot_size)
+
+        # Stop trading if account is blown
+        if balance <= 0:
+            break
 
         # Calculate PnL in USD
         pnl_usd = trade.pnl_pips * pip_value(pair_name, lot_size)

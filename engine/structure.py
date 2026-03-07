@@ -63,12 +63,28 @@ def detect_structure_breaks(df: pd.DataFrame, swings: List[SwingPoint]
                 candidates.append((j, "bullish", prev_sh))
                 break
 
+    # Also check for breaks of the last swing high through end of data
+    if swing_highs:
+        last_sh = swing_highs[-1]
+        for j in range(last_sh.index + 1, len(df)):
+            if high_arr[j] > last_sh.price:
+                candidates.append((j, "bullish", last_sh))
+                break
+
     for i in range(1, len(swing_lows)):
         prev_sl = swing_lows[i - 1]
         curr_sl = swing_lows[i]
         for j in range(prev_sl.index + 1, min(curr_sl.index + 1, len(df))):
             if low_arr[j] < prev_sl.price:
                 candidates.append((j, "bearish", prev_sl))
+                break
+
+    # Also check for breaks of the last swing low through end of data
+    if swing_lows:
+        last_sl = swing_lows[-1]
+        for j in range(last_sl.index + 1, len(df)):
+            if low_arr[j] < last_sl.price:
+                candidates.append((j, "bearish", last_sl))
                 break
 
     # Sort candidates chronologically, then classify BOS/CHoCH with correct bias
