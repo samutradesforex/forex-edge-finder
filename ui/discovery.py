@@ -119,13 +119,12 @@ def render():
                 st.warning("Discovery paused.")
 
             if r or s.combos_tested > 0:
-                p1, p2, p3, p4, p5 = st.columns(5)
-                p1.metric("Tested", f"{s.combos_tested:,}")
-                p2.metric("Total", f"{s.total_combos:,}")
-                p3.metric("Edges", s.edges_found)
-                p4.metric("Validated", getattr(s, "edges_validated", 0))
+                p1, p2, p3, p4 = st.columns(4)
+                p1.metric("Tested", f"{s.combos_tested:,} / {s.total_combos:,}")
+                p2.metric("Edges Found", s.edges_found)
+                p3.metric("Validated", getattr(s, "edges_validated", 0))
                 elapsed = s.elapsed_seconds
-                p5.metric("Elapsed", f"{elapsed/60:.0f}m" if elapsed > 60 else f"{elapsed:.0f}s")
+                p4.metric("Elapsed", f"{elapsed/60:.0f}m" if elapsed > 60 else f"{elapsed:.0f}s")
 
         _progress()
 
@@ -161,15 +160,13 @@ def render():
 
     filtered.sort(key=lambda e: e.score, reverse=True)
 
-    # Table
+    # Table — focused columns, params accessible via Edge Explorer
     rows = []
     for i, e in enumerate(filtered[:100]):
         is_v = getattr(e, "validated", False)
-        param_str = ", ".join(f"{k}={v}" for k, v in e.params.items())
         grade = getattr(e, "confidence_grade", None) or compute_edge_confidence(e)
         age = get_edge_age_days(e)
         mc_p = getattr(e, "mc_pvalue", None)
-        rr = getattr(e, "payoff_ratio", 0)
         rows.append({
             "#": i + 1,
             "Grade": grade,
@@ -177,19 +174,15 @@ def render():
             "TF": e.interval,
             "Strategy": e.strategy.replace("_", " ").title(),
             "Trades": e.total_trades,
-            "Win Rate": f"{e.win_rate:.0f}%",
-            "RR": f"{rr:.2f}" if rr and rr < 99 else "-",
-            "Net Pips": f"{e.total_pips:+.1f}",
-            "PF": f"{e.profit_factor:.2f}",
-            "Expect": f"{e.expectancy_pips:+.1f}",
+            "WR": f"{e.win_rate:.0f}%",
+            "PF": fmt_pf(e.profit_factor),
+            "Expect": f"{e.expectancy_pips:+.1f}p",
             "Sharpe": f"{e.sharpe_ratio:.2f}",
-            "Max DD": f"{e.max_drawdown_pips:.1f}",
-            "Score": f"{e.score:.1f}",
+            "Score": f"{e.score:.0f}",
             "MC p": f"{mc_p:.3f}" if mc_p is not None and mc_p < 1.0 else "-",
             "OOS WR": f"{e.oos_win_rate:.0f}%" if is_v else "-",
-            "OOS PF": f"{e.oos_profit_factor:.2f}" if is_v else "-",
+            "OOS PF": fmt_pf(e.oos_profit_factor) if is_v else "-",
             "Age": f"{age}d" if age >= 0 else "-",
-            "Params": param_str,
         })
 
     if rows:

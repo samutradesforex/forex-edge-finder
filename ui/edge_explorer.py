@@ -109,24 +109,20 @@ def render():
         o5.metric("OOS Sharpe", f"{edge.oos_sharpe_ratio:.2f}",
                   delta=f"{edge.oos_sharpe_ratio - edge.sharpe_ratio:+.2f}")
 
-        # IS vs OOS comparison chart
-        metrics = ["Win Rate", "Profit Factor", "Sharpe"]
-        is_vals = [edge.win_rate / 100, edge.profit_factor / 3, edge.sharpe_ratio / 3]
-        oos_vals = [edge.oos_win_rate / 100, edge.oos_profit_factor / 3,
-                    edge.oos_sharpe_ratio / 3]
-
-        comp_fig = go.Figure()
-        comp_fig.add_trace(go.Bar(
-            x=metrics, y=[edge.win_rate, edge.profit_factor, edge.sharpe_ratio],
-            name="In-Sample", marker_color=BLUE,
-        ))
-        comp_fig.add_trace(go.Bar(
-            x=metrics, y=[edge.oos_win_rate, edge.oos_profit_factor,
-                          edge.oos_sharpe_ratio],
-            name="Out-of-Sample", marker_color=GREEN,
-        ))
-        comp_fig.update_layout(**CHART_LAYOUT, height=280, barmode="group",
-                               legend=CHART_LEGEND_H)
+        # IS vs OOS comparison — separate subplots per metric for honest scaling
+        comp_fig = make_subplots(rows=1, cols=3, subplot_titles=["Win Rate %", "Profit Factor", "Sharpe"])
+        for col, (is_v, oos_v, label) in enumerate([
+            (edge.win_rate, edge.oos_win_rate, "WR"),
+            (edge.profit_factor, edge.oos_profit_factor, "PF"),
+            (edge.sharpe_ratio, edge.oos_sharpe_ratio, "Sharpe"),
+        ], 1):
+            comp_fig.add_trace(go.Bar(
+                x=["IS", "OOS"], y=[is_v, oos_v],
+                marker_color=[BLUE, GREEN],
+                text=[f"{is_v:.1f}", f"{oos_v:.1f}"], textposition="outside",
+                showlegend=False,
+            ), row=1, col=col)
+        comp_fig.update_layout(**CHART_LAYOUT, height=260)
         st.plotly_chart(comp_fig, use_container_width=True)
 
     # ── Parameters ──
@@ -206,13 +202,12 @@ def _render_full_result(result, edge):
 
     # ── Risk metrics ──
     section("Risk Metrics")
-    r1, r2, r3, r4, r5, r6 = st.columns(6)
+    r1, r2, r3, r4, r5 = st.columns(5)
     r1.metric("Sharpe", fmt_pf(result.sharpe_ratio))
     r2.metric("Sortino", fmt_pf(result.sortino_ratio))
-    r3.metric("Calmar", fmt_pf(result.calmar_ratio))
-    r4.metric("Recovery", fmt_pf(result.recovery_factor))
-    r5.metric("Win Streak", result.max_consecutive_wins)
-    r6.metric("Loss Streak", result.max_consecutive_losses)
+    r3.metric("Recovery", fmt_pf(result.recovery_factor))
+    r4.metric("Win Streak", result.max_consecutive_wins)
+    r5.metric("Loss Streak", result.max_consecutive_losses)
 
     # ── PnL distribution ──
     section("PnL Distribution")

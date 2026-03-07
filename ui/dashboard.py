@@ -161,24 +161,20 @@ def render():
             st.plotly_chart(fig, use_container_width=True)
 
         with col_stats:
-            # Cache stats
-            cache = get_cache_stats()
-            st.markdown("**Data Cache**")
-            st.markdown(
-                f"- {cache['files']} files ({cache['total_size_mb']:.1f} MB)\n"
-                f"- {len(cache['pairs'])} pairs cached\n"
-                f"- Intervals: {', '.join(cache['intervals'])}"
-            )
-
-            # Score distribution
             if validated:
                 avg_score = sum(e.score for e in validated) / len(validated)
-                st.markdown(f"**Avg Validated Score:** {avg_score:.1f}")
                 best_pf = max(validated, key=lambda e: e.profit_factor)
                 st.markdown(
+                    f"**Avg Score:** {avg_score:.0f}\n\n"
                     f"**Best PF:** {best_pf.profit_factor:.2f} "
                     f"({best_pf.pair} {best_pf.strategy})"
                 )
+            cache = get_cache_stats()
+            st.caption(
+                f"Cache: {cache['files']} files, "
+                f"{cache['total_size_mb']:.1f} MB, "
+                f"{len(cache['pairs'])} pairs"
+            )
 
 
 def _progress_banner(state, running):
@@ -197,46 +193,35 @@ def _progress_banner(state, running):
                         text=f"{s.progress_pct:.1f}% — {s.current_pair} "
                              f"{s.current_interval} {s.current_strategy} | "
                              f"{s.edges_found} edges ({s.edges_validated} validated)")
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Tested", f"{s.combos_tested:,}")
-        p2.metric("Total", f"{s.total_combos:,}")
-        p3.metric("Edges", s.edges_found)
-        p4.metric("Validated", f"{getattr(s, 'edges_validated', 0)}")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Tested", f"{s.combos_tested:,} / {s.total_combos:,}")
+        p2.metric("Edges Found", s.edges_found)
+        p3.metric("Validated", f"{getattr(s, 'edges_validated', 0)}")
 
     _live()
 
 
 def _render_edge_table(edges):
-    """Render a compact edge table with confidence grades and age."""
+    """Render a focused edge table — only the columns that matter for decisions."""
     import pandas as pd
     rows = []
     for i, e in enumerate(edges):
         validated = getattr(e, "validated", False)
         grade = getattr(e, "confidence_grade", None) or compute_edge_confidence(e)
-        age = get_edge_age_days(e)
-        age_str = f"{age}d" if age >= 0 else "-"
-        mc_p = getattr(e, "mc_pvalue", None)
-        mc_str = f"{mc_p:.3f}" if mc_p is not None and mc_p < 1.0 else "-"
         stale = is_edge_stale(e)
-        rr = getattr(e, "payoff_ratio", 0)
-        rr_str = f"{rr:.2f}" if rr and rr < 99 else "-"
+        status = "STALE" if stale else ("Valid" if validated else "-")
         rows.append({
-            "#": i + 1,
             "Grade": grade,
             "Pair": e.pair,
             "TF": e.interval,
             "Strategy": e.strategy.replace("_", " ").title(),
             "Trades": e.total_trades,
-            "Win Rate": f"{e.win_rate:.0f}%",
-            "RR": rr_str,
-            "PF": f"{e.profit_factor:.2f}",
+            "WR": f"{e.win_rate:.0f}%",
+            "PF": fmt_pf(e.profit_factor),
             "Expect": f"{e.expectancy_pips:+.1f}p",
-            "Sharpe": f"{e.sharpe_ratio:.2f}",
             "Score": f"{e.score:.0f}",
-            "MC p": mc_str,
             "OOS WR": f"{e.oos_win_rate:.0f}%" if validated else "-",
-            "OOS PF": f"{e.oos_profit_factor:.2f}" if validated else "-",
-            "Age": age_str,
-            "Status": "STALE" if stale else ("Valid" if validated else "-"),
+            "OOS PF": fmt_pf(e.oos_profit_factor) if validated else "-",
+            "Status": status,
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)

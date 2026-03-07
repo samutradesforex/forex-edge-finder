@@ -1218,6 +1218,16 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    # ANSI colors (only when outputting to a real terminal)
+    _tty = os.isatty(1)
+    DIM = "\033[2m" if _tty else ""
+    BOLD = "\033[1m" if _tty else ""
+    GREEN = "\033[32m" if _tty else ""
+    YELLOW = "\033[33m" if _tty else ""
+    CYAN = "\033[36m" if _tty else ""
+    WHITE = "\033[97m" if _tty else ""
+    RESET = "\033[0m" if _tty else ""
+
     last_line_len = 0
 
     def _progress(state):
@@ -1226,32 +1236,50 @@ def main():
         eta = ""
         if state.combos_tested > 0 and pct > 0:
             remaining = state.elapsed_seconds / pct * (100 - pct)
-            eta = f" | ETA: {remaining/60:.0f}m"
+            if remaining >= 60:
+                eta = f" {DIM}ETA {remaining/60:.0f}m{RESET}"
+            else:
+                eta = f" {DIM}ETA {remaining:.0f}s{RESET}"
 
-        # Use \n for log-file compatibility instead of \r
+        # Build a compact progress bar
+        bar_w = 20
+        filled = int(pct / 100 * bar_w)
+        bar = f"{GREEN}{'█' * filled}{DIM}{'░' * (bar_w - filled)}{RESET}"
+
         line = (
-            f"[{pct:5.1f}%] {state.current_pair} {state.current_interval} "
-            f"{state.current_strategy} | "
-            f"{state.edges_found} edges ({state.edges_validated} validated) | "
-            f"{state.combos_tested}/{state.total_combos}{eta}"
+            f"  {bar} {WHITE}{pct:5.1f}%{RESET} "
+            f"{CYAN}{state.current_pair:<8}{RESET} {state.current_interval:<3} "
+            f"{DIM}{state.current_strategy}{RESET} "
+            f"{GREEN}{state.edges_found}{RESET}e "
+            f"{DIM}{state.combos_tested}/{state.total_combos}{RESET}{eta}"
         )
 
-        if os.isatty(1):
-            # Terminal: use \r for clean output
+        if _tty:
             padding = max(0, last_line_len - len(line))
             print(f"\r{line}{' ' * padding}", end="", flush=True)
             last_line_len = len(line)
         else:
-            # File/pipe: use newlines
-            print(line, flush=True)
+            # Strip ANSI for log files
+            import re
+            clean = re.sub(r'\033\[[0-9;]*m', '', line).strip()
+            print(clean, flush=True)
 
-    print("Starting Forex Edge Discovery...")
-    print(f"Pairs: {args.pairs or 'all'}")
-    print(f"Strategies: {args.strategies or 'all'}")
-    print(f"Intervals: {args.intervals or ALL_INTERVALS}")
-    print(f"Period: {args.period}")
-    print(f"Walk-forward validation: {'OFF' if args.no_validate else 'ON'}")
-    print(f"Resume: {'YES' if args.resume else 'NO'}")
+    # Header
+    pairs_str = ", ".join(args.pairs) if args.pairs else "all"
+    strats_str = ", ".join(args.strategies) if args.strategies else "all"
+    intervals = args.intervals or ALL_INTERVALS
+    validate = not args.no_validate
+
+    print()
+    print(f"  {BOLD}{WHITE}FOREX EDGE DISCOVERY{RESET}")
+    print(f"  {DIM}{'─' * 40}{RESET}")
+    print(f"  {DIM}Pairs{RESET}      {pairs_str}")
+    print(f"  {DIM}Strategies{RESET} {strats_str}")
+    print(f"  {DIM}Intervals{RESET}  {', '.join(intervals)}")
+    print(f"  {DIM}Period{RESET}     {args.period}")
+    print(f"  {DIM}Validation{RESET} {GREEN + 'ON' + RESET if validate else YELLOW + 'OFF' + RESET}")
+    if args.resume:
+        print(f"  {DIM}Resume{RESET}     {GREEN}YES{RESET}")
     print()
 
     state = run_discovery(
@@ -1260,41 +1288,55 @@ def main():
         intervals=args.intervals,
         period=args.period,
         on_progress=_progress,
-        validate=not args.no_validate,
+        validate=validate,
         resume=args.resume,
     )
 
-    print(f"\n\nDiscovery complete!")
-    print(f"Tested: {state.combos_tested} combos in {state.elapsed_seconds:.0f}s")
-    print(f"Edges found: {state.edges_found} ({state.edges_validated} validated)")
+    # Summary
+    elapsed = state.elapsed_seconds
+    if elapsed >= 60:
+        time_str = f"{elapsed/60:.1f}m"
+    else:
+        time_str = f"{elapsed:.0f}s"
+
+    print(f"\n\n  {BOLD}{GREEN}COMPLETE{RESET} {DIM}in {time_str}{RESET}")
+    print(f"  {state.combos_tested:,} combos tested")
+    print(f"  {GREEN}{state.edges_found}{RESET} edges found "
+          f"({GREEN}{state.edges_validated}{RESET} validated)")
 
     if state.edges:
         validated = [e for e in state.edges if e.validated]
         unvalidated = [e for e in state.edges if not e.validated]
 
         if validated:
-            print(f"\nTop 10 VALIDATED edges:")
-            print(f"{'Pair':<10} {'TF':<4} {'Strategy':<16} {'Trades':>6} {'WR':>6} "
-                  f"{'PF':>6} {'OOS_WR':>7} {'OOS_PF':>7} {'Score':>7}")
-            print("-" * 80)
+            print(f"\n  {BOLD}{WHITE}VALIDATED EDGES{RESET} (top 10)")
+            print(f"  {DIM}{'─' * 72}{RESET}")
+            hdr = (f"  {DIM}{'Pair':<9} {'TF':<4} {'Strategy':<16} "
+                   f"{'Tr':>4} {'WR':>6} {'PF':>6} "
+                   f"{'OOS WR':>7} {'OOS PF':>7} {'Score':>6}{RESET}")
+            print(hdr)
             for e in sorted(validated, key=lambda x: x.score, reverse=True)[:10]:
-                print(f"{e.pair:<10} {e.interval:<4} {e.strategy:<16} "
-                      f"{e.total_trades:>6} {e.win_rate:>5.1f}% "
-                      f"{e.profit_factor:>6.2f} {e.oos_win_rate:>6.1f}% "
-                      f"{e.oos_profit_factor:>7.2f} {e.score:>7.1f}")
+                wr_c = GREEN if e.win_rate >= 50 else YELLOW
+                pf_c = GREEN if e.profit_factor >= 1.5 else YELLOW if e.profit_factor >= 1.0 else ""
+                print(f"  {WHITE}{e.pair:<9}{RESET} {e.interval:<4} {e.strategy:<16} "
+                      f"{e.total_trades:>4} {wr_c}{e.win_rate:>5.1f}%{RESET} "
+                      f"{pf_c}{e.profit_factor:>6.2f}{RESET} "
+                      f"{e.oos_win_rate:>6.1f}% {e.oos_profit_factor:>7.2f} "
+                      f"{BOLD}{e.score:>6.0f}{RESET}")
 
         if unvalidated:
-            print(f"\nTop 5 unvalidated edges (use with caution):")
-            print(f"{'Pair':<10} {'TF':<4} {'Strategy':<16} {'Trades':>6} {'WR':>6} "
-                  f"{'Pips':>8} {'PF':>6} {'Score':>7}")
-            print("-" * 70)
+            print(f"\n  {YELLOW}UNVALIDATED{RESET} (top 5, use with caution)")
+            print(f"  {DIM}{'─' * 60}{RESET}")
+            hdr = (f"  {DIM}{'Pair':<9} {'TF':<4} {'Strategy':<16} "
+                   f"{'Tr':>4} {'WR':>6} {'PF':>6} {'Score':>6}{RESET}")
+            print(hdr)
             for e in sorted(unvalidated, key=lambda x: x.score, reverse=True)[:5]:
-                print(f"{e.pair:<10} {e.interval:<4} {e.strategy:<16} "
-                      f"{e.total_trades:>6} {e.win_rate:>5.1f}% "
-                      f"{e.total_pips:>+7.1f} {e.profit_factor:>6.2f} "
-                      f"{e.score:>7.1f}")
+                print(f"  {WHITE}{e.pair:<9}{RESET} {e.interval:<4} {e.strategy:<16} "
+                      f"{e.total_trades:>4} {e.win_rate:>5.1f}% "
+                      f"{e.profit_factor:>6.2f} {e.score:>6.0f}")
 
-    print(f"\nResults saved to {RESULTS_DIR}/")
+    print(f"\n  {DIM}Results saved to {RESULTS_DIR}/{RESET}")
+    print()
 
 
 if __name__ == "__main__":
