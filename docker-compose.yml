@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  # Web UI — the main terminal
+  web:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - edge-data:/app/data/.cache
+      - edge-results:/app/data/.results
+    restart: unless-stopped
+    environment:
+      - STREAMLIT_THEME_BASE=dark
+
+  # Headless discovery runner — runs 24/7 in the background
+  # Uncomment to run discovery separately from the web UI
+  # discovery:
+  #   build: .
+  #   entrypoint: ["python", "cli.py", "discover", "--continuous"]
+  #   volumes:
+  #     - edge-data:/app/data/.cache
+  #     - edge-results:/app/data/.results
+  #   restart: unless-stopped
+
+volumes:
+  edge-data:
+  edge-results:
