@@ -216,3 +216,197 @@ def pnl_distribution_chart(win_pnls, loss_pnls, avg_pnl, height=280):
                       xaxis_title="Pips", yaxis_title="Count",
                       legend=CHART_LEGEND_H)
     return fig
+
+
+# ── Advanced chart helpers ───────────────────────────────────────────────
+
+def edge_heatmap(edges, metric="score", height=450):
+    """Heatmap of pair x strategy performance from discovered edges.
+
+    Args:
+        edges: List of DiscoveredEdge objects
+        metric: Which metric to display ("score", "profit_factor", "win_rate",
+                "expectancy_pips", "sharpe_ratio")
+        height: Chart height in pixels
+    """
+    if not edges:
+        return go.Figure()
+
+    pairs = sorted(set(e.pair for e in edges))
+    strategies = sorted(set(e.strategy for e in edges))
+
+    # Build matrix: best value per pair x strategy cell
+    matrix = np.full((len(pairs), len(strategies)), np.nan)
+    for e in edges:
+        pi = pairs.index(e.pair)
+        si = strategies.index(e.strategy)
+        val = getattr(e, metric, 0)
+        if val != val or val == float("inf") or val == float("-inf"):
+            val = 0
+        # Keep the best value per cell
+        if np.isnan(matrix[pi, si]) or val > matrix[pi, si]:
+            matrix[pi, si] = val
+
+    display_strats = [s.replace("_", " ").title() for s in strategies]
+
+    # Color scale based on metric
+    if metric in ("score", "profit_factor", "sharpe_ratio", "expectancy_pips"):
+        colorscale = [[0, RED], [0.4, "#30363d"], [0.6, "#30363d"], [1, GREEN]]
+    elif metric == "win_rate":
+        colorscale = [[0, RED], [0.45, "#30363d"], [0.55, "#30363d"], [1, GREEN]]
+    else:
+        colorscale = [[0, RED], [0.5, "#30363d"], [1, GREEN]]
+
+    fig = go.Figure(go.Heatmap(
+        z=matrix, x=display_strats, y=pairs,
+        colorscale=colorscale,
+        text=np.where(np.isnan(matrix), "",
+                      np.vectorize(lambda v: f"{v:.1f}")(matrix)),
+        texttemplate="%{text}",
+        textfont=dict(size=11, color="#e6edf3"),
+        hoverongaps=False,
+        colorbar=dict(title=metric.replace("_", " ").title(),
+                      tickfont=dict(color=MUTED)),
+    ))
+    layout = {**CHART_LAYOUT}
+    layout.pop("xaxis", None)
+    layout.pop("yaxis", None)
+    fig.update_layout(
+        **layout, height=height,
+        xaxis=dict(side="top", tickangle=-30, gridcolor="rgba(48,54,61,0.5)",
+                   zeroline=False),
+        yaxis=dict(gridcolor="rgba(48,54,61,0.5)", zeroline=False),
+    )
+    return fig
+
+
+def monte_carlo_chart(equity_curve, n_simulations=500, confidence=0.95,
+                      height=380):
+    """Monte Carlo simulation with confidence bands around an equity curve.
+
+    Shuffles trade PnLs to generate alternate equity paths,
+    then plots percentile bands.
+    """
+    if len(equity_curve) < 3:
+        return go.Figure()
+
+    # Extract per-trade PnLs from equity curve
+    pnls = np.diff(equity_curve)
+    n_trades = len(pnls)
+
+    # Run simulations
+    rng = np.random.default_rng(42)
+    sim_curves = np.zeros((n_simulations, n_trades + 1))
+    for i in range(n_simulations):
+        shuffled = rng.permutation(pnls)
+        sim_curves[i] = np.concatenate([[0], np.cumsum(shuffled)])
+
+    # Percentile bands
+    lo_pct = (1 - confidence) / 2 * 100
+    hi_pct = (1 - (1 - confidence) / 2) * 100
+    p5 = np.percentile(sim_curves, lo_pct, axis=0)
+    p25 = np.percentile(sim_curves, 25, axis=0)
+    p50 = np.percentile(sim_curves, 50, axis=0)
+    p75 = np.percentile(sim_curves, 75, axis=0)
+    p95 = np.percentile(sim_curves, hi_pct, axis=0)
+
+    x = list(range(len(equity_curve)))
+
+    fig = go.Figure()
+
+    # Confidence bands (outer)
+    fig.add_trace(go.Scatter(
+        x=x, y=p95.tolist(), mode="lines",
+        line=dict(width=0), showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=p5.tolist(), mode="lines",
+        line=dict(width=0), fill="tonexty",
+        fillcolor="rgba(88,166,255,0.08)",
+        name=f"{confidence*100:.0f}% CI",
+    ))
+
+    # IQR band (inner)
+    fig.add_trace(go.Scatter(
+        x=x, y=p75.tolist(), mode="lines",
+        line=dict(width=0), showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=p25.tolist(), mode="lines",
+        line=dict(width=0), fill="tonexty",
+        fillcolor="rgba(88,166,255,0.15)",
+        name="IQR",
+    ))
+
+    # Median simulation
+    fig.add_trace(go.Scatter(
+        x=x, y=p50.tolist(), mode="lines",
+        line=dict(color=BLUE, width=1, dash="dot"),
+        name="MC Median",
+    ))
+
+    # Actual equity curve
+    fig.add_trace(go.Scatter(
+        x=x, y=list(equity_curve), mode="lines",
+        line=dict(color=GREEN, width=2.5),
+        name="Actual",
+    ))
+
+    mc_layout = {**CHART_LAYOUT}
+    mc_layout.pop("legend", None)
+    fig.update_layout(
+        **mc_layout, height=height,
+        yaxis_title="Cumulative Pips",
+        xaxis_title="Trade #",
+        legend=CHART_LEGEND_H,
+    )
+    return fig
+
+
+def correlation_matrix_chart(edges, height=400):
+    """Correlation matrix between edge equity curves.
+
+    Shows how correlated different edges are — useful for portfolio construction.
+    Edges with low correlation are better combined.
+    """
+    if len(edges) < 2:
+        return go.Figure()
+
+    # Build PnL series aligned by trade number
+    labels = []
+    pnl_series = []
+    for e in edges:
+        ec = getattr(e, "equity_curve", None)
+        if ec and len(ec) > 2:
+            labels.append(f"{e.pair}\n{e.strategy[:8]}")
+            pnl_series.append(np.diff(ec))
+
+    if len(pnl_series) < 2:
+        return go.Figure()
+
+    # Pad to equal length
+    max_len = max(len(s) for s in pnl_series)
+    padded = np.zeros((len(pnl_series), max_len))
+    for i, s in enumerate(pnl_series):
+        padded[i, :len(s)] = s
+
+    corr = np.corrcoef(padded)
+    # Replace NaN with 0 (happens when a series is all zeros)
+    corr = np.nan_to_num(corr, nan=0.0)
+
+    fig = go.Figure(go.Heatmap(
+        z=corr, x=labels, y=labels,
+        colorscale=[[0, BLUE], [0.5, "#0d1117"], [1, RED]],
+        zmin=-1, zmax=1,
+        text=np.vectorize(lambda v: f"{v:.2f}")(corr),
+        texttemplate="%{text}",
+        textfont=dict(size=10, color="#e6edf3"),
+        colorbar=dict(title="Corr", tickfont=dict(color=MUTED)),
+    ))
+    corr_layout = {**CHART_LAYOUT}
+    corr_layout.pop("xaxis", None)
+    corr_layout.pop("yaxis", None)
+    fig.update_layout(**corr_layout, height=height,
+                      xaxis=dict(side="top", tickangle=-30, zeroline=False),
+                      yaxis=dict(zeroline=False))
+    return fig

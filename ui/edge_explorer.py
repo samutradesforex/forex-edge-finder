@@ -8,7 +8,7 @@ from plotly.subplots import make_subplots
 from ui.components import (
     section, edge_badge, edge_score_badge, fmt_pf,
     equity_curve_chart, monthly_pnl_chart, win_rate_donut,
-    pnl_distribution_chart,
+    pnl_distribution_chart, monte_carlo_chart, correlation_matrix_chart,
 )
 from ui.theme import GREEN, RED, GOLD, BLUE, CYAN, CHART_LAYOUT, CHART_LEGEND_H
 from engine.discovery import load_edges, compute_edge_confidence, get_edge_age_days
@@ -25,6 +25,18 @@ def render():
             "then come back here to analyze them in detail."
         )
         return
+
+    # ── Portfolio overview (correlation between top edges) ──
+    edges_with_ec = [e for e in edges if getattr(e, "equity_curve", None) and len(e.equity_curve) > 2]
+    if len(edges_with_ec) >= 2:
+        with st.expander("Portfolio Correlation Matrix", expanded=False):
+            top_for_corr = sorted(edges_with_ec, key=lambda e: e.score, reverse=True)[:12]
+            corr_fig = correlation_matrix_chart(top_for_corr, height=400)
+            st.plotly_chart(corr_fig, use_container_width=True)
+            st.caption(
+                "Low correlation between edges = better diversification. "
+                "Combine edges with low/negative correlation for smoother equity."
+            )
 
     # ── Edge selector ──
     validated = [e for e in edges if getattr(e, "validated", False)]
@@ -180,10 +192,19 @@ def _render_full_result(result, edge):
     badge = edge_badge(result)
     st.markdown(badge, unsafe_allow_html=True)
 
-    # ── Equity curve ──
-    section("Equity Curve")
-    fig = equity_curve_chart(result.equity_curve, height=340)
-    st.plotly_chart(fig, use_container_width=True)
+    # ── Equity curve + Monte Carlo ──
+    eq_tab, mc_tab = st.tabs(["Equity Curve", "Monte Carlo Simulation"])
+    with eq_tab:
+        fig = equity_curve_chart(result.equity_curve, height=340)
+        st.plotly_chart(fig, use_container_width=True)
+    with mc_tab:
+        mc_fig = monte_carlo_chart(result.equity_curve, n_simulations=500,
+                                   height=380)
+        st.plotly_chart(mc_fig, use_container_width=True)
+        st.caption(
+            "Monte Carlo: shuffles trade order 500x to show how much of the "
+            "equity curve shape is due to trade sequencing vs actual edge."
+        )
 
     # ── Win rate + Monthly PnL ──
     col1, col2 = st.columns([1, 2])

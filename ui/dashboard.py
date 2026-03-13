@@ -2,7 +2,7 @@
 
 import streamlit as st
 import plotly.graph_objects as go
-from ui.components import section, status_indicator, fmt_pf, score_bar_html
+from ui.components import section, status_indicator, fmt_pf, score_bar_html, edge_heatmap
 from ui.theme import GREEN, RED, GOLD, BLUE, CYAN, CHART_LAYOUT
 from engine.discovery import (
     is_discovery_running, get_discovery_state, load_edges,
@@ -175,6 +175,18 @@ def render():
                 f"{cache['total_size_mb']:.1f} MB, "
                 f"{len(cache['pairs'])} pairs"
             )
+
+    # ── Performance heatmap ──
+    if edges and len(set(e.pair for e in edges)) >= 2:
+        section("Performance Heatmap (Pair x Strategy)")
+        hm_metric = st.selectbox(
+            "Metric", ["score", "profit_factor", "win_rate",
+                        "expectancy_pips", "sharpe_ratio"],
+            index=0, key="dash_hm_metric",
+            label_visibility="collapsed",
+        )
+        fig_hm = edge_heatmap(edges, metric=hm_metric)
+        st.plotly_chart(fig_hm, use_container_width=True)
 
 
 def _progress_banner(state, running):
